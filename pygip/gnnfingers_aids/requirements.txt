@@ -1,0 +1,10 @@
+
+torch
+torchvision
+torchaudio
+torch-geometric
+torch-scatter
+torch-sparse
+torch-cluster
+scikit-learn
+numpy

@@ -1,0 +1,10 @@
+
+torch==2.*
+torchvision==0.*
+torchaudio==2.*
+torch-geometric
+torch-scatter
+torch-sparse
+torch-cluster
+scikit-learn
+numpy
