@@ -6,6 +6,7 @@ from .SurviveWM import SurviveWM
 from .SurviveWM2 import SurviveWM2
 from .atom.ATOM import ATOM
 from .Integrity import QueryBasedVerificationDefense as IntegrityVerification
+from .GNNFingers import GNNFingersDefense
 
 __all__ = [
     'BackdoorWM',
@@ -14,5 +15,6 @@ __all__ = [
     'RandomWM',
     'SurviveWM',
     'SurviveWM2',
-    'ATOM'
+    'ATOM',
+    'GNNFingersDefense'
 ]
