@@ -17,4 +17,4 @@ dist/
 .LSOverride
 
 #virtual environments folder
-.venv
+venv/
