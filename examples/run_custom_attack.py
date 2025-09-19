@@ -1,7 +1,7 @@
 # examples/run_custom_attack.py
 import argparse
 from pygip.datasets.datasets import Dataset
-from src.custom_attack import FeatureFlipAttack
+from pygip.src.custom_attack import FeatureFlipAttack
 
 def main():
     parser = argparse.ArgumentParser()
