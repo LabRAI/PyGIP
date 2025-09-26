@@ -7,6 +7,8 @@ from .datasets import (
     Photo,
     CoauthorCS,
     CoauthorPhysics,
+    MUTAG,
+    MUTAGGraphClassification
 )
 
 __all__ = [
@@ -18,4 +20,6 @@ __all__ = [
     'Photo',
     'CoauthorCS',
     'CoauthorPhysics',
+    'MUTAG',
+    'MUTAGGraphClassification'
 ]
