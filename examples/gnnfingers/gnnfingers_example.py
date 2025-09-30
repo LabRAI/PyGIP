@@ -56,7 +56,8 @@ def run_experiment():
 
         # 5. Link Prediction (Cora) - MANUAL task_type required
         # dataset = Cora(api_type='pyg')
-        # dataset.task_type = 'link_prediction'  # Required for link prediction
+        # Pass task_type = 'link_prediction' to GNNFingersDefense constructor for link prediction
+
 
         # Initialize and run defense (simple PyGIP way)
         defense = GNNFingersDefense(dataset, attack_node_fraction=0.1)
