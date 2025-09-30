@@ -24,6 +24,8 @@ from torch_geometric.datasets import PolBlogs as PolBlogsPyG
 from torch_geometric.datasets import Reddit
 from torch_geometric.datasets import TUDataset  # ENZYMES
 
+## Added for EGSteal
+from torch_geometric.transforms import Constant
 
 def dgl_to_tg(dgl_graph):
     edge_index = torch.stack(dgl_graph.edges())
@@ -565,3 +567,32 @@ class YelpData(Dataset):
         dataset = YelpDataset(raw_dir=self.path)
         self.graph_dataset = dataset
         self.graph_data = dataset[0]
+
+class MUTAGGraphClassification(Dataset):
+    def __init__(self, api_type='pyg', path='./data'):
+        super().__init__(api_type, path)
+    
+    def _load_meta_data(self):
+        if self.api_type == 'pyg':
+            ds = self.graph_dataset  
+            self.num_features = int(ds.num_node_features)
+            self.num_classes  = int(ds.num_classes)
+            self.num_graphs    = int(len(ds))
+            self.num_edge_features = int(ds.num_edge_features) if ds.num_edge_features is not None else 0
+        else:
+            super()._load_meta_data()
+
+    def load_pyg_data(self):
+        self.dataset_name = 'Mutagenicity'
+        temp_dataset = TUDataset(root=self.path,name='Mutagenicity')
+        data_transform = None
+        if temp_dataset.num_node_features == 0:
+            print("\nNo node features found. Adding constant node features (all ones).")
+            data_transform = Constant(value=1, cat=False)
+        self.graph_dataset = TUDataset(root=self.path,name='Mutagenicity',transform=data_transform)
+        num_graphs = len(self.graph_dataset)
+        print(f"\nTotal number of graphs in {self.dataset_name}: {num_graphs}")
+        print(f"Node features dimension: {self.graph_dataset.num_node_features}")
+        print(f"Edge features dimension: {self.graph_dataset.num_edge_features if hasattr(self.graph_dataset, 'num_edge_features') else 'N/A'}")
+        print(f"Number of classes: {self.graph_dataset.num_classes if hasattr(self.graph_dataset, 'num_classes') else 'N/A'}")
+        return self.graph_dataset
