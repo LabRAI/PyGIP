@@ -1,95 +1,128 @@
 import copy
 import random
+import time
 
 import dgl
-import numpy as np
 import torch
-import torch.nn.functional as F
+import numpy as np
 import torch.optim as optim
-from torch.optim import Adam
-from torch_geometric.utils import to_networkx, from_networkx
 from tqdm import tqdm
+from torch.optim import Adam
+import torch.nn.functional as F
+from torch_geometric.utils import to_networkx, from_networkx
 
-from pygip.models.nn import GCN
 from .base import BaseDefense
+from pygip.models.nn import GCN
+from pygip.utils.metrics import DefenseCompMetric, DefenseMetric
 
 
 class QueryBasedVerificationDefense(BaseDefense):
     supported_api_types = {"dgl"}
     supported_datasets = {}
 
-    def __init__(self, dataset, attack_node_fraction, model_path=None):
-        super().__init__(dataset, attack_node_fraction)
+    def __init__(self, dataset, defense_ratio=0.1, model_path=None):
+        super().__init__(dataset, defense_ratio)
+        self.model = None
+        self.defense_ratio = defense_ratio
+        self.graph_data = dataset.graph_data
+        # compute related parameters
+        self.k = max(1, int(dataset.num_nodes * defense_ratio))
         self.model_path = model_path
 
     def defend(self, fingerprint_mode='inductive', knowledge='full', attack_type='bitflip',
-               k=5, num_trials=10, use_edge_perturbation=False, verbose=True, **kwargs):
-
+               k=5, num_trials=1, use_edge_perturbation=False, verbose=True, **kwargs):
         """
-        Main defense routine. Generates fingerprints, runs attacks, and verifies integrity.
-        Returns a dict with per-trial and average metrics.
+        Execute the query-based verification defense.
         """
-        trial_results = []
-        for trial in range(num_trials):
-            if verbose:
-                print(f"\n=== Trial {trial + 1}/{num_trials} ===")
+        metric_comp = DefenseCompMetric()
+        metric_comp.start()
+        print("====================Query Based Verification Defense====================")
 
-            model_clean = self._train_target_model()
-            acc_clean = self._evaluate_accuracy(model_clean, self.dataset)
+        # If model wasn't trained yet, train it
+        if not hasattr(self, 'model_trained'):
+            self.train_target_model(metric_comp)
 
-            fingerprints = self._generate_fingerprints(model_clean, mode=fingerprint_mode, knowledge=knowledge, k=k,
-                                                       perturb_fingerprints=use_edge_perturbation,
-                                                       perturb_budget=kwargs.get('perturb_budget', 5),
-                                                       **kwargs)
+        # Generate fingerprints and evaluate the defended model
+        fingerprints = self._generate_fingerprints(
+            self.model, mode=fingerprint_mode, knowledge=knowledge, k=k,
+            perturb_fingerprints=use_edge_perturbation,
+            perturb_budget=kwargs.get('perturb_budget', 5), **kwargs
+        )
 
-            bit = kwargs.pop('bit', 30)
-            bfa_variant = kwargs.pop('bfa_variant', 'BFA')
+        preds = self.evaluate_model(self.model, self.dataset)
+        inference_s = time.time()
+        detection_results = self.verify_defense(self.model, fingerprints, attack_type, **kwargs)
+        inference_e = time.time()
 
-            poisoned_model, attack_info = self._run_attack(
-                model_clean,
-                attack_type=attack_type,
-                knowledge=knowledge,
-                bit=bit,
-                bfa_variant=bfa_variant,
-                **kwargs
-            )
+        # metric
+        metric = DefenseMetric()
+        labels = self.dataset.graph_data.ndata['label'][self.dataset.graph_data.ndata['test_mask']]
+        metric.update(preds, labels)
 
-            poisoned_dataset = copy.deepcopy(self.dataset)
-            if 'graph' in attack_info:
-                poisoned_dataset.graph_data = attack_info['graph']
-            acc_poisoned = self._evaluate_accuracy(poisoned_model, poisoned_dataset)
+        # Convert detection results to binary format
+        detection_preds, detection_targets = self._convert_detection_to_binary(detection_results)
+        metric.update_wm(detection_preds, detection_targets)
+        metric_comp.end()
 
-            flipped_info = self._evaluate_fingerprints(poisoned_model, fingerprints)
+        print("====================Final Results====================")
+        res = metric.compute()
+        metric_comp.update(inference_defense_time=(inference_e - inference_s))
+        res_comp = metric_comp.compute()
 
-            flip_rate = flipped_info['flip_rate']
-            acc_drop = acc_clean - acc_poisoned
-            num_flipped = len(flipped_info['flipped'])
-            num_total = len(fingerprints)
-            detection_rate = num_flipped / num_total if num_total > 0 else 0.0
+        return res, res_comp
 
-            if verbose:
-                print(f"Clean Accuracy:    {acc_clean:.4f}")
-                print(f"Poisoned Accuracy: {acc_poisoned:.4f}")
-                print(f"Accuracy Drop:     {acc_drop:.4f}")
-                print(f"Flip Rate:         {flip_rate:.4f}")
-                print(f"Detection Rate:    {detection_rate:.4f}")
+    def train_target_model(self, metric_comp: DefenseCompMetric):
+        """Train the target model with defense mechanism."""
+        defense_s = time.time()
 
-            trial_results.append({
-                'flip_rate': flip_rate,
-                'accuracy_drop': acc_drop,
-                'detection_rate': detection_rate
-            })
+        # Training and fingerprint generation (defense mechanism)
+        self.model = self._train_target_model()
+        self.model_trained = True
 
-        avg_flip_rate = sum(r['flip_rate'] for r in trial_results) / num_trials
-        avg_acc_drop = sum(r['accuracy_drop'] for r in trial_results) / num_trials
-        avg_detection_rate = sum(r['detection_rate'] for r in trial_results) / num_trials
+        defense_e = time.time()
+        metric_comp.update(defense_time=(defense_e - defense_s))
+        return self.model
+
+    def evaluate_model(self, model, dataset):
+        """Evaluate model performance on downstream task"""
+        model.eval()
+        features = self._get_features().to(self.device)
+        labels = dataset.graph_data.ndata['label'].to(self.device)
+        test_mask = dataset.graph_data.ndata['test_mask']
+
+        with torch.no_grad():
+            logits = model(dataset.graph_data.to(self.device), features)
+            preds = logits.argmax(dim=1)[test_mask].cpu()
+        return preds
+
+    def verify_defense(self, model, fingerprints, attack_type, **kwargs):
+        """Verify defense effectiveness by running attack and checking fingerprints"""
+        # Run attack
+        poisoned_model, attack_info = self._run_attack(
+            model, attack_type=attack_type, **kwargs
+        )
+
+        # Evaluate fingerprints
+        flipped_info = self._evaluate_fingerprints(poisoned_model, fingerprints)
 
         return {
-            'trial_results': trial_results,
-            'average_flip_rate': avg_flip_rate,
-            'average_accuracy_drop': avg_acc_drop,
-            'average_detection_rate': avg_detection_rate
+            'flip_rate': flipped_info['flip_rate'],
+            'flipped_fingerprints': flipped_info['flipped'],
+            'total_fingerprints': len(fingerprints)
         }
+
+    @staticmethod
+    def _convert_detection_to_binary(detection_results):
+        """Convert detection results to binary classification format"""
+        total = detection_results['total_fingerprints']
+        flipped = len(detection_results['flipped_fingerprints'])
+
+        # Create binary predictions: 1 for attack detected, 0 for no attack
+        detection_preds = torch.tensor([1 if flipped > 0 else 0])
+        # In this case, we assume attack was actually performed, so target is 1
+        detection_targets = torch.tensor([1])
+
+        return detection_preds, detection_targets
 
     def _get_features(self):
         return self.graph_data.ndata['feat'] if hasattr(self.graph_data, 'ndata') else self.graph_data.x
@@ -341,7 +374,7 @@ class QueryBasedVerificationDefense(BaseDefense):
         dataset_poisoned = copy.deepcopy(self.dataset)
         dataset_poisoned.graph_data = poisoned_graph
 
-        defense = QueryBasedVerificationDefense(dataset=dataset_poisoned, attack_node_fraction=0.1)
+        defense = QueryBasedVerificationDefense(dataset=dataset_poisoned, defense_ratio=0.1)
         model = defense._train_target_model(epochs=epochs)
         return model
 

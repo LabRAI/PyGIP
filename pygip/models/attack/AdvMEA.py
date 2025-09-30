@@ -9,7 +9,7 @@ from tqdm import tqdm
 
 from pygip.models.attack.base import BaseAttack
 from pygip.models.nn import GCN
-from pygip.utils.metrics import GraphNeuralNetworkMetric
+from pygip.utils.metrics import AttackMetric, AttackCompMetric
 
 
 class AdvMEA(BaseAttack):
@@ -90,12 +90,15 @@ class AdvMEA(BaseAttack):
         return tensor
 
     def attack(self):
+        metric_comp = AttackCompMetric()
+        metric_comp.start()
         g = self.graph.clone()
         # Move adjacency matrix to CPU for NumPy operations
         g_matrix = np.asmatrix(self._to_cpu(g.adjacency_matrix().to_dense()).numpy())
         edge_index = np.array(np.nonzero(g_matrix))
         edge_index = torch.tensor(edge_index, dtype=torch.long)
 
+        attack_s1 = time.time()
         # Select a center node with certain size
         while True:
             node_index = torch.randint(0, self.num_nodes, (1,)).item()
@@ -129,13 +132,18 @@ class AdvMEA(BaseAttack):
 
         SA = [As]
         SX = [Xs]
+        attack_e1 = time.time()
 
+        query_s = time.time()
         # Query the target model
         self.net1.eval()
         with torch.no_grad():
             logits_query = self.net1(g, self.features)
             _, labels_query = torch.max(logits_query, dim=1)
 
+        query_e = time.time()
+
+        attack_s2 = time.time()
         src, dst = As.nonzero(as_tuple=True)
         initial_num_nodes = Xs.shape[0]
         initial_graph = dgl.graph((src, dst), num_nodes=initial_num_nodes).to(self.device)
@@ -195,19 +203,17 @@ class AdvMEA(BaseAttack):
         sub_g = dgl.graph((src, dst), num_nodes=num_total_nodes).to(self.device)
         sub_g.ndata['feat'] = XG.to(self.device)
 
+        attack_e2 = time.time()
+
+        train_surrogate_s = time.time()
         # Create and train the extracted model
         net6 = GCN(XG.shape[1], self.num_classes).to(self.device)
         optimizer = torch.optim.Adam(net6.parameters(), lr=0.01, weight_decay=5e-4)
 
-        dur = []
-
         print("=========Model Extracting==========================")
-        best_performance_metrics = GraphNeuralNetworkMetric()
+        metric = AttackMetric()
 
         for epoch in tqdm(range(200)):
-            if epoch >= 3:
-                t0 = time.time()
-
             net6.train()
             logits = net6(sub_g, sub_g.ndata['feat'])
             out = torch.log_softmax(logits, dim=1)
@@ -217,24 +223,23 @@ class AdvMEA(BaseAttack):
             loss.backward()
             optimizer.step()
 
-            if epoch >= 3:
-                dur.append(time.time() - t0)
-
             # Switch to evaluation mode
+            t0 = time.time()
             net6.eval()
             with torch.no_grad():
-                focus_gnn_metrics = GraphNeuralNetworkMetric(
-                    0, 0, net6, g, self.features, self.test_mask, self.labels, labels_query)
-                focus_gnn_metrics.evaluate()
+                logits = net6(g, self.features)
+                _, preds = torch.max(logits[self.test_mask], dim=1)
+                metric.update(preds, self.labels[self.test_mask], labels_query[self.test_mask])
+            metric_comp.update(inference_surrogate_time=(time.time() - t0))
 
-                best_performance_metrics.fidelity = max(
-                    best_performance_metrics.fidelity, focus_gnn_metrics.fidelity)
-                best_performance_metrics.accuracy = max(
-                    best_performance_metrics.accuracy, focus_gnn_metrics.accuracy)
+        train_surrogate_e = time.time()
 
         print("========================Final results:=========================================")
-        print(best_performance_metrics)
+        metric_comp.end()
+        metric_comp.update(attack_time=(attack_e1 - attack_s1 + attack_e2 - attack_s2),
+                           query_target_time=(query_e - query_s),
+                           train_surrogate_time=(train_surrogate_e - train_surrogate_s))
+        res = metric.compute()
+        res_comp = metric_comp.compute()
 
-        self.net2 = net6
-
-        return best_performance_metrics, net6
+        return res, res_comp

@@ -1,12 +1,12 @@
 import random
+from time import time
 
 import torch
 import torch.nn.functional as F
-from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score, roc_auc_score
 
 from pygip.models.defense.base import BaseDefense
 from pygip.models.nn import GCN
-from pygip.utils.metrics import GraphNeuralNetworkMetric
+from pygip.utils.metrics import DefenseMetric, DefenseCompMetric
 
 
 class BackdoorWM(BaseDefense):
@@ -68,7 +68,7 @@ class BackdoorWM(BaseDefense):
             data[node][feature_indices] = trigger_feat_val
         return data, trigger_nodes
 
-    def train_target_model(self):
+    def train_target_model(self, metric_comp: DefenseCompMetric):
         """
         Train the target model with backdoor injection.
         """
@@ -77,6 +77,7 @@ class BackdoorWM(BaseDefense):
         optimizer = torch.optim.Adam(self.net1.parameters(), lr=0.01, weight_decay=5e-4)
 
         # Inject backdoor trigger
+        defense_s = time()
         poisoned_features = self.features.clone()
         poisoned_labels = self.labels.clone()
 
@@ -96,6 +97,7 @@ class BackdoorWM(BaseDefense):
         self.trigger_nodes = trigger_nodes
         self.poisoned_features = poisoned_features
         self.poisoned_labels = poisoned_labels
+        defense_e = time()
 
         # Training loop
         for epoch in range(200):
@@ -121,59 +123,57 @@ class BackdoorWM(BaseDefense):
                     acc_val = (pred[self.test_mask] == poisoned_labels[self.test_mask]).float().mean()
                     print(f"  Epoch {epoch}: training... Validation Accuracy: {acc_val.item():.4f}")
 
+        metric_comp.update(defense_time=(defense_e - defense_s))
+
         return self.net1
 
-    def verify_backdoor(self, model, trigger_nodes, target_label):
+    def verify_backdoor(self, model, trigger_nodes):
         """Verify backdoor attack success rate"""
         model.eval()
         with torch.no_grad():
             out = model(self.graph_data, self.poisoned_features)
-            pred = out.argmax(dim=1)
-            correct = (pred[trigger_nodes] == target_label).sum().item()
-            return correct / len(trigger_nodes)
+            backdoor_preds = out.argmax(dim=1)[trigger_nodes]
+            # correct = (pred[trigger_nodes] == target_label).sum().item()
+        return backdoor_preds
 
-    def evaluate_model(self, model, features, labels):
+    def evaluate_model(self, model, features):
         """Evaluate model performance"""
         model.eval()
         with torch.no_grad():
             out = model(self.graph_data, features)
             logits = out[self.test_mask]
             preds = logits.argmax(dim=1).cpu()
-            labels_test = labels[self.test_mask].cpu()
-            probs = F.softmax(logits, dim=1).cpu()
 
-            return {
-                'accuracy': accuracy_score(labels_test, preds),
-                'f1': f1_score(labels_test, preds, average='macro'),
-                'precision': precision_score(labels_test, preds, average='macro'),
-                'recall': recall_score(labels_test, preds, average='macro'),
-                'auroc': roc_auc_score(labels_test, probs, multi_class='ovo')
-            }
+        return preds
 
     def defend(self):
         """
-        Execute the backdoor watermark attack.
+        Execute the backdoor watermark defense.
         """
-        print("=========Backdoor Watermark Attack==========================")
+        metric_comp = DefenseCompMetric()
+        metric_comp.start()
+        print("====================Backdoor Watermark====================")
 
         # If model wasn't trained yet, train it
         if not hasattr(self, 'net1'):
-            self.train_target_model()
+            self.train_target_model(metric_comp)
 
         # Evaluate the backdoored model
-        metrics = self.evaluate_model(self.net1, self.poisoned_features, self.poisoned_labels)
-        wm_acc = self.verify_backdoor(self.net1, self.trigger_nodes, self.target_label)
+        preds = self.evaluate_model(self.net1, self.poisoned_features)
+        inference_s = time()
+        backdoor_preds = self.verify_backdoor(self.net1, self.trigger_nodes)
+        inference_e = time()
 
-        # Create performance metrics object
-        performance_metrics = GraphNeuralNetworkMetric()
-        performance_metrics.accuracy = metrics['accuracy']
-        performance_metrics.f1 = metrics['f1']
-        performance_metrics.fidelity = wm_acc  # Use watermark accuracy as fidelity
+        # metric
+        metric = DefenseMetric()
+        metric.update(preds, self.poisoned_labels[self.test_mask])
+        target = torch.full_like(backdoor_preds, fill_value=self.target_label)
+        metric.update_wm(backdoor_preds, target)
+        metric_comp.end()
 
-        print("========================Final results:=========================================")
-        print(f"Model Accuracy: {metrics['accuracy']:.4f}")
-        print(f"F1 Score: {metrics['f1']:.4f}")
-        print(f"Watermark Accuracy: {wm_acc:.4f}")
-        print(performance_metrics)
+        print("====================Final Results====================")
+        res = metric.compute()
+        metric_comp.update(inference_defense_time=(inference_e - inference_s))
+        res_comp = metric_comp.compute()
 
-        return performance_metrics, self.net1
+        return res, res_comp

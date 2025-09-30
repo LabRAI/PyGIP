@@ -2,6 +2,7 @@ import ast
 import os
 import random
 from pathlib import Path
+from time import time
 
 import networkx as nx
 import numpy as np
@@ -30,6 +31,7 @@ from tqdm import tqdm
 
 from pygip.datasets.datasets import Dataset as PyGIPDataset
 from pygip.models.defense.base import BaseDefense
+from pygip.utils.metrics import DefenseMetric, DefenseCompMetric
 
 
 def set_seed(seed: int):
@@ -257,7 +259,9 @@ def load_data_and_model(csv_path, batch_size, seed, data_path, lamb):
     except NameError:
         parent_dir = Path.cwd().parent
         print(
-            "If __file__ is not defined, the directory above the current working directory is used as the target directory.")
+            "If __file__ is not defined, "
+            "the directory above the current working directory is used as the target directory."
+        )
 
     os.chdir(parent_dir)
 
@@ -538,7 +542,11 @@ def compute_returns_and_advantages(memory, gamma=0.99, lam=0.95):
     memory.advantages = advantages
 
 
-def custom_reward_function(predicted, label):
+def custom_reward_function(predicted, label, predicted_distribution=None):
+    reward = 0.0
+    if predicted_distribution is not None:
+        if predicted_distribution > 0.90:
+            reward += -8.0
     if predicted == 1 and label == 0:
         return -22.0
     if predicted == 0 and label == 1:
@@ -547,6 +555,7 @@ def custom_reward_function(predicted, label):
         return 16.0
     if predicted == 0 and label == 0:
         return 16.0
+    return reward
 
 
 class PolicyNetwork(nn.Module):
@@ -633,52 +642,43 @@ class PPOAgent(nn.Module):
         self.policy_old.load_state_dict(self.policy.state_dict())
 
 
-def compute_returns_and_advantages(memory, gamma=0.99, lam=0.95):
-    rewards = torch.stack(memory.rewards, dim=0).squeeze(-1)
-    dones = torch.stack(memory.dones, dim=0).squeeze(-1)
-
-    batch_size = rewards.size(0)
-    returns = torch.zeros_like(rewards)
-    advantages = torch.zeros_like(rewards)
-
-    running_return = 0.0
-    running_adv = 0.0
-
-    for t in reversed(range(batch_size)):
-        running_return = rewards[t] + gamma * running_return * (1 - dones[t])
-        returns[t] = running_return
-        advantages[t] = returns[t] - 0
-    memory.returns = returns
-    memory.advantages = advantages
-
-
-def custom_reward_function(predicted, label, predicted_distribution=None):
-    reward = 0.0
-    if predicted_distribution is not None:
-        if predicted_distribution > 0.90:
-            reward += -8.0
-    if predicted == 1 and label == 0:
-        reward += -22.0
-    if predicted == 0 and label == 1:
-        reward += -18.0
-    if predicted == 1 and label == 1:
-        reward += 16.0
-    if predicted == 0 and label == 0:
-        reward += 16.0
-    return reward
-
-
 class ATOM(BaseDefense):
     supported_api_types = {"pyg"}
-    supported_datasets = {"Cora", "CiteSeer", "PubMed"}
+    supported_datasets = {
+        "Cora", "CiteSeer", "PubMed",
+        "Computers", "Photo",
+        "CS", "Physics"
+    }
 
     def __init__(self, dataset: PyGIPDataset, attack_node_fraction: float = 0):
         super().__init__(dataset, attack_node_fraction)
+        self.dataset = dataset
+        # Load dataset related information, following BackdoorWM pattern
+        self.graph_dataset = dataset.graph_dataset
+        self.graph_data = dataset.graph_data
 
-    def _load_data_and_model(self, dataset, batch_size=16, seed=0, lamb=0):
+        # Get basic information
+        self.num_nodes = dataset.num_nodes
+        self.num_features = dataset.num_features
+        self.num_classes = dataset.num_classes
+
+        # Set device
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.graph_data = self.graph_data.to(device=self.device)
+
+    def _load_data_and_model(self, batch_size=16, seed=0, lamb=0):
+        """
+        Load data and model following BackdoorWM format
+        Use data from self.dataset directly instead of reloading
+        """
+        # Get dataset name
+        dataset_name = self.dataset.__class__.__name__
+
+        # Build CSV path
         current_dir = os.path.dirname(os.path.abspath(__file__))
-        csv_path = os.path.join(current_dir, 'csv_data', f'attack_{dataset.__class__.__name__}.csv')
+        csv_path = os.path.join(current_dir, 'csv_data', f'attack_{dataset_name}.csv')
 
+        # Load sequence data
         train_loader, val_loader, test_loader = build_loaders(
             csv_path=csv_path,
             batch_size=batch_size,
@@ -686,110 +686,225 @@ class ATOM(BaseDefense):
             seed=seed
         )
 
-        trained_gcn = GCN(dataset.num_features, 16, dataset.num_classes)
-        target_model = TargetGCN(trained_model=trained_gcn, data=dataset.graph_data)
+        # Use PyG format directly (since we declared supported_api_types = {"pyg"})
+        features = self.graph_data.x
+        labels = self.graph_data.y
+        train_mask = self.graph_data.train_mask
+        test_mask = self.graph_data.test_mask
 
-        G = to_networkx(dataset.graph_data, to_undirected=True)
+        # Create and train GCN model
+        trained_gcn = GCN(self.num_features, 16, self.num_classes).to(self.device)
+        target_model = TargetGCN(trained_model=trained_gcn, data=self.graph_data)
+
+        # Train model
+        self._train_gcn_model(trained_gcn, self.graph_data, train_mask, labels)
+
+        # Compute k-core decomposition of the graph
+        G = to_networkx(self.graph_data, to_undirected=True)
         G.remove_edges_from(nx.selfloop_edges(G))
         k_core_values_graph = k_core_decomposition(G)
         max_k_core = torch.tensor(max(k_core_values_graph.values()), dtype=torch.float32)
 
+        # Precompute embeddings for all nodes
         all_embeddings = precompute_all_node_embeddings(
-            target_model, dataset.graph_data, k_core_values_graph, max_k_core, lamb=lamb
+            target_model, self.graph_data, k_core_values_graph, max_k_core, lamb=lamb
         )
 
-        return train_loader, val_loader, test_loader, target_model, max_k_core, all_embeddings, dataset
+        return train_loader, val_loader, test_loader, target_model, max_k_core, all_embeddings
+
+    def _convert_to_networkx(self):
+        """
+        Convert graph data to NetworkX format, compatible with different graph data structures
+        """
+        if hasattr(self.graph_data, 'edge_index'):
+            # PyG format
+            return to_networkx(self.graph_data, to_undirected=True)
+        else:
+            # DGL format - requires conversion
+            # This may need adjustment based on specific DGL format
+            edge_list = []
+            if hasattr(self.graph_data, 'edges'):
+                src, dst = self.graph_data.edges()
+                edge_list = list(zip(src.cpu().numpy(), dst.cpu().numpy()))
+
+            G = nx.Graph()
+            G.add_nodes_from(range(self.num_nodes))
+            G.add_edges_from(edge_list)
+            return G
+
+    def _create_default_masks(self):
+        """
+        Create default train/test masks for datasets without predefined masks
+        """
+        num_nodes = self.num_nodes
+        num_train = int(num_nodes * 0.6)
+        num_test = int(num_nodes * 0.2)
+
+        perm = torch.randperm(num_nodes)
+        train_mask = torch.zeros(num_nodes, dtype=torch.bool, device=self.device)
+        test_mask = torch.zeros(num_nodes, dtype=torch.bool, device=self.device)
+
+        train_mask[perm[:num_train]] = True
+        test_mask[perm[num_train:num_train + num_test]] = True
+
+        return train_mask, test_mask
+
+    @staticmethod
+    def _train_gcn_model(model, data, train_mask, labels):
+        """
+        Train GCN model for PyG format
+        """
+        model.train()
+        optimizer = torch.optim.Adam(model.parameters(), lr=0.01, weight_decay=5e-4)
+        criterion = nn.NLLLoss()
+
+        features = data.x
+        edge_index = data.edge_index
+
+        for epoch in range(200):
+            optimizer.zero_grad()
+            output, _ = model(features, edge_index)
+            loss = criterion(output[train_mask], labels[train_mask])
+            loss.backward()
+            optimizer.step()
+
+            if epoch % 50 == 0:
+                print(f"  Epoch {epoch}: Loss: {loss.item():.4f}")
+
+    @staticmethod
+    def _evaluate_downstream_task(model, data, test_mask, labels):
+        """
+        Evaluate model performance on downstream task
+        """
+        model.eval()
+        with torch.no_grad():
+            output, _ = model(data.x, data.edge_index)
+            preds = output[test_mask].argmax(dim=1).cpu()
+            true_labels = labels[test_mask].cpu()
+
+        return preds, true_labels
 
     def defend(self):
+        """
+        Execute ATOM defense, following BackdoorWM's defend method structure
+        """
+        metric_comp = DefenseCompMetric()
+        metric_comp.start()
+
+        print("====================ATOM Defense====================")
+
+        # Configuration parameters
+        config = {
+            "seed": 37719,
+            "K_epochs": 10,
+            "batch_size": 16,
+            "hidden_size": 196,
+            "hidden_action_dim": 16,
+            "clip_epsilon": 0.30,
+            "entropy_coef": 0.05,
+            "lr": 1e-3,
+            "gamma": 0.99,
+            "lam": 0.95,
+            "num_epochs": 2,
+            "lamb": 0
+        }
+
+        # Set random seed
+        set_seed(config["seed"])
+
+        # Load data and model
+        defense_s = time()
+        train_loader, val_loader, test_loader, target_model, max_k_core, all_embeddings = self._load_data_and_model(
+            batch_size=config["batch_size"],
+            seed=config["seed"],
+            lamb=config["lamb"]
+        )
+
+        # Set device and parameters
+        device = self.device
+        action_dim = 2
+        hidden_size = config["hidden_size"]
+
+        # Initialize model components
+        input_size = self.num_classes
+        gru = FusionGRU(input_size=input_size, hidden_size=hidden_size).to(device)
+        mlp_transform = StateTransformMLP(action_dim, config["hidden_action_dim"], hidden_size).to(device)
+        agent = PPOAgent(
+            learning_rate=config["lr"],
+            batch_size=config["batch_size"],
+            K_epochs=config["K_epochs"],
+            state_dim=hidden_size,
+            action_dim=action_dim,
+            gru=gru,
+            mlp=mlp_transform,
+            clip_epsilon=config["clip_epsilon"],
+            entropy_coef=config["entropy_coef"],
+            device=device
+        ).to(device)
+
+        # Training process
+        memory = Memory()
         accuracy_list = []
         precision_list = []
         recall_list = []
         f1_list = []
         auc_value_list = []
-        config: dict = {}
 
-        seed = config.get("seed", 37719)
-        K_epochs = config.get("K_epochs", 10)
-        batch_size = config.get("batch_size", 16)
-        hidden_size = config.get("hidden_size", 196)
-        hidden_action_dim = config.get("hidden_action_dim", 16)
-        clip_epsilon = config.get("clip_epsilon", 0.30)
-        entropy_coef = config.get("entropy_coef", 0.05)
-        lr = config.get("lr", 1e-3)
-        gamma = config.get("gamma", 0.99)
-        lam = config.get("lam", 0.95)
-        num_epochs = config.get("num_epochs", 2)  # TODO 50, 100, 150
-        save_dir = config.get('save_dir', None)
-        csv_path = config.get("csv_path", None)
-        data_path = config.get("data_path", "CiteSeer")
-        lamb = config.get("lamb", 0)
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        action_dim = 2
-
-        # for seed_now in seed:
-        seed_now = seed
-        set_seed(seed_now)
-
-        train_loader, val_loader, test_loader, target_model, max_k_core, all_embeddings, data = self._load_data_and_model(
-            # TODO allow attack generate query
-            self.dataset)
-
-        input_size = data.num_classes
-        embedding_dim = input_size
-        gru = FusionGRU(input_size=input_size, hidden_size=hidden_size).to(device)
-        mlp_transform = StateTransformMLP(action_dim, hidden_action_dim, hidden_size).to(device)
-        agent = PPOAgent(
-            learning_rate=lr,
-            batch_size=batch_size,
-            K_epochs=K_epochs,
-            state_dim=hidden_size,
-            action_dim=action_dim,
-            gru=gru,
-            mlp=mlp_transform,
-            clip_epsilon=clip_epsilon,
-            entropy_coef=entropy_coef,
-            device=device
-        ).to(device)
-
-        memory = Memory()
-        best_val_reward = float('-inf')
-
-        for epoch in tqdm(range(num_epochs), desc="Training Epochs", ncols=100):
+        for epoch in tqdm(range(config["num_epochs"]), desc="Training Epochs", ncols=100):
+            # Training logic
             episode_reward = 0.0
             for batch_idx, (batch_seqs, batch_labels) in enumerate(train_loader):
                 batch_labels = batch_labels.to(device)
 
+                # Convert sequences to tensors and pad them
                 batch_seqs = [torch.tensor(seq, dtype=torch.long, device=device) for seq in batch_seqs]
                 padded_seqs = pad_sequence(batch_seqs, batch_first=True, padding_value=0)
                 mask = (padded_seqs != 0).float().to(device)
                 max_seq_len = padded_seqs.size(1)
+
+                # Extract embeddings for all time steps
                 all_inputs = []
                 for t in range(max_seq_len):
                     node_indices = padded_seqs[:, t].tolist()
                     cur_inputs = all_embeddings[node_indices]
                     all_inputs.append(cur_inputs)
                 all_inputs = torch.stack(all_inputs, dim=1).to(device)
+
+                # Process through GRU
                 hidden_states = gru.process_sequence(all_inputs)
                 masked_hidden_states = hidden_states * mask.unsqueeze(-1)
+
+                # Prepare probability factors
                 prob_factors = torch.ones(len(batch_seqs), max_seq_len, action_dim, device=device)
                 if memory.all_probs:
                     prob_factors[:, :-1] = torch.stack([
                         torch.tensor(memory.all_probs.get(t, [1.0] * action_dim))
                         for t in range(max_seq_len - 1)
                     ], dim=1).to(device)
+
+                # Transform states
                 custom_states = (mlp_transform(prob_factors) * masked_hidden_states).detach()
+
+                # Select actions using PPO agent
                 actions, log_probs, entropies, probs = agent.select_action(
                     custom_states.view(-1, hidden_size)
                 )
+
+                # Reshape outputs
                 actions = actions.view(len(batch_seqs), max_seq_len)
                 log_probs = log_probs.view(len(batch_seqs), max_seq_len)
                 entropies = entropies.view(len(batch_seqs), max_seq_len)
                 probs = probs.view(len(batch_seqs), max_seq_len, action_dim)
+
+                # Initialize rewards and done flags
                 rewards = torch.zeros(len(batch_seqs), max_seq_len, device=device)
                 dones = torch.zeros(len(batch_seqs), max_seq_len, device=device)
+
+                # Compute rewards
                 batch_predictions = actions.cpu().numpy()
                 predicted_distribution = (batch_predictions == 1).mean()
                 last_valid_steps = mask.sum(dim=1).long() - 1
+
                 for i in range(len(batch_seqs)):
                     for t in range(last_valid_steps[i] + 1):
                         if mask[i, t] == 1:
@@ -801,40 +916,80 @@ class ATOM(BaseDefense):
                             rewards[i, t] = r
                             episode_reward += r
                     dones[i, last_valid_steps[i]] = 1.0
+
+                # Store experience in memory
                 memory.store(custom_states, actions, log_probs, rewards, dones,
                              entropy=entropies, masks=mask)
-                compute_returns_and_advantages(memory, gamma=gamma, lam=lam)
+
+                # Compute returns and advantages
+                compute_returns_and_advantages(memory, gamma=config["gamma"], lam=config["lam"])
+
+                # Update agent
                 agent.update(memory)
                 memory.clear()
 
+            # Testing and evaluation
             agent.eval()
             gru.eval()
             mlp_transform.eval()
             with torch.no_grad():
-                accuracy, precision, recall, f1, auc_value = test_model(agent, gru, mlp_transform, test_loader,
-                                                                        target_model, data, all_embeddings, hidden_size,
-                                                                        device)
+                accuracy, precision, recall, f1, auc_value = test_model(
+                    agent, gru, mlp_transform, test_loader,
+                    target_model, self.graph_data, all_embeddings, hidden_size, device
+                )
                 accuracy_list.append(accuracy)
                 precision_list.append(precision)
                 recall_list.append(recall)
                 f1_list.append(f1)
                 auc_value_list.append(auc_value)
 
-        report_metrics = {
-            "accuracy": np.mean(accuracy_list),
-            "precision": np.mean(precision_list),
-            "recall": np.mean(recall_list),
-            "f1_score": np.mean(f1_list),
-            "auc": np.mean(auc_value_list),
-            "accuracy_std": np.std(accuracy_list),
-            "precision_std": np.std(precision_list),
-            "recall_std": np.std(recall_list),
-            "f1_score_std": np.std(f1_list),
-            "auc_std": np.std(auc_value_list)
-        }
+        defense_e = time()
+        inference_s = time()
 
-        print("==============================Final results==============================")
-        for name, value in report_metrics.items():
-            print(f"{name}: {value:.4f}")
+        # Calculate final watermark results
+        wm_accuracy = np.mean(accuracy_list)
+        wm_precision = np.mean(precision_list)
+        wm_recall = np.mean(recall_list)
+        wm_f1 = np.mean(f1_list)
+        wm_auc = np.mean(auc_value_list)
 
-        return report_metrics
+        # Evaluate downstream task performance
+        if hasattr(self.graph_data, 'test_mask'):
+            test_mask = self.graph_data.test_mask
+            labels = self.graph_data.y if hasattr(self.graph_data, 'y') else self.graph_data.ndata.get('label')
+        else:
+            _, test_mask = self._create_default_masks()
+            labels = self.graph_data.y if hasattr(self.graph_data, 'y') else self.graph_data.ndata.get('label')
+
+        downstream_preds, downstream_true = self._evaluate_downstream_task(
+            target_model.model, self.graph_data, test_mask, labels
+        )
+
+        # Convert watermark results to tensors for metric computation
+        wm_predictions = torch.tensor([1 if acc > 0.5 else 0 for acc in accuracy_list[-10:]])
+        wm_targets = torch.ones_like(wm_predictions)
+
+        inference_e = time()
+
+        # Compute metrics
+        metric = DefenseMetric()
+        metric.update(downstream_preds, downstream_true)
+        metric.update_wm(wm_predictions, wm_targets)
+
+        metric_comp.update(
+            defense_time=(defense_e - defense_s),
+            inference_defense_time=(inference_e - inference_s)
+        )
+        metric_comp.end()
+
+        print("====================Final Results====================")
+        res = metric.compute()
+        res_comp = metric_comp.compute()
+
+        # Print detailed results
+        print(f"Downstream Task - Accuracy: {res['accuracy']:.4f}, F1: {res['f1']:.4f}")
+        print(f"Watermark Detection - Accuracy: {wm_accuracy:.4f}, AUC: {wm_auc:.4f}")
+        print(f"Defense Time: {res_comp['defense_time']:.4f}s")
+        print(f"Inference Time: {res_comp['inference_defense_time']:.4f}s")
+
+        return res, res_comp

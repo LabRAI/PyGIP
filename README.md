@@ -12,6 +12,20 @@
 PyGIP is a Python library designed for experimenting with graph-based model extraction attacks and defenses. It provides
 a modular framework to implement and test attack and defense strategies on graph datasets.
 
+## How to Cite
+
+If you find it useful, please considering cite the following work:
+
+```bibtex
+@article{li2025intellectual,
+  title={Intellectual Property in Graph-Based Machine Learning as a Service: Attacks and Defenses},
+  author={Li, Lincan and Shen, Bolin and Zhao, Chenxi and Sun, Yuxiang and Zhao, Kaixiang and Pan, Shirui and Dong, Yushun},
+  journal={arXiv preprint arXiv:2508.19641},
+  year={2025}
+}
+```
+
+
 ## Installation
 
 PyGIP supports both CPU and GPU environments. Make sure you have Python installed (version >= 3.8, <3.13).
