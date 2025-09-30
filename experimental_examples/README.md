@@ -17,7 +17,6 @@ experimental_examples/
 ├── dataset.py        # Dataset loader
 ├── models.py         # GNN model definitions
 ├── fingerprints.py   # Fingerprint generation & univerifier
-├── verification_metrics.json # Verification metrics
 └── README.md         # This documentation
 ```
 
