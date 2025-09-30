@@ -618,14 +618,14 @@ class GNNFingersDefense(BaseDefense):
         Returns:
             str: Task type (node_classification, graph_classification, etc.)
         """
-        if self.dataset.name in ['Cora', 'Citeseer']:
-            if self.dataset.task_type == 'link_prediction':
+        if self.dataset.dataset_name in ['Cora', 'Citeseer']:
+            if self.task_type == 'link_prediction':
                 return 'link_prediction'
             else:
                 return 'node_classification'
-        elif self.dataset.name in ['ENZYMES', 'PROTEINS']:
+        elif self.dataset.dataset_name in ['ENZYMES', 'PROTEINS']:
             return 'graph_classification'
-        elif self.dataset.name in ['AIDS', 'LINUX']:
+        elif self.dataset.dataset_name in ['AIDS', 'LINUX']:
             return 'graph_matching'
         else:
             return 'node_classification'
@@ -639,7 +639,7 @@ class GNNFingersDefense(BaseDefense):
         """
 
         print(f"\n{'='*60}")
-        print(f"GNNFingers Defense: {self.task_type} on {self.dataset.name}")
+        print(f"GNNFingers Defense: {self.task_type} on {self.dataset.dataset_name}")
         print(f"{'='*60}")
 
         # Step 1: Train target model
@@ -689,7 +689,7 @@ class GNNFingersDefense(BaseDefense):
             num_features = self.num_features
             num_classes = self.num_classes
             # SMALLER model for ENZYMES to prevent overfitting
-            if self.dataset.name == 'ENZYMES':
+            if self.dataset.dataset_name == 'ENZYMES':
                 hidden_dim = 8  # Reduced from 16
                 dropout = 0.7    # Increased from 0.5
             else:
@@ -698,7 +698,7 @@ class GNNFingersDefense(BaseDefense):
             self.target_model = GCNGraphClassifier(num_features, hidden_dim, num_classes, dropout=dropout).to(self.device)
             self._train_graph_model(self.target_model)
         elif self.task_type == 'graph_matching':
-            hidden_dim = 32 if self.dataset.name == 'AIDS' else 16
+            hidden_dim = 32 if self.dataset.dataset_name == 'AIDS' else 16
             self.target_model = GraphMatchingModel(self.num_features, hidden_dim).to(self.device)
             self._train_matching_model(self.target_model)
         elif self.task_type == 'link_prediction':
@@ -795,7 +795,7 @@ class GNNFingersDefense(BaseDefense):
         print(f"  Val labels: {set(val_y)}")
 
         # NEW: Dataset-specific settings
-        if self.dataset.name == 'PROTEINS':
+        if self.dataset.dataset_name == 'PROTEINS':
             # PROTEINS is larger and more complex, needs different settings
             batch_size = 64  # Larger batch size (was 32)
             learning_rate = 0.001  # Lower learning rate (was 0.01)
@@ -863,7 +863,7 @@ class GNNFingersDefense(BaseDefense):
             epochs (int): Number of training epochs
         """
         # Use reduced settings for AIDS/LINUX datasets
-        if hasattr(self.dataset, 'name') and self.dataset.name in ['AIDS', 'LINUX']:
+        if hasattr(self.dataset, 'name') and self.dataset.dataset_name in ['AIDS', 'LINUX']:
             epochs = 10
             max_pairs = 100
             subset_size = min(200, len(self.graph_dataset))  # Increase from 50
@@ -1310,7 +1310,7 @@ class GNNFingersDefense(BaseDefense):
             self.neg_models.append(model.eval())
 
         # Split into train and test sets
-        if hasattr(self.dataset, 'name') and self.dataset.name in ['AIDS', 'LINUX']:
+        if hasattr(self.dataset, 'name') and self.dataset.dataset_name in ['AIDS', 'LINUX']:
             n_pos_tr = n_neg_tr = 5
         else:
             n_pos_tr = self.config['POS_TRAIN']
@@ -1371,13 +1371,13 @@ class GNNFingersDefense(BaseDefense):
 
 
         # NEW: Add dataset-specific weight decay for regularization
-       # if self.dataset.name == 'PROTEINS':
+       # if self.dataset.dataset_name == 'PROTEINS':
           #  weight_decay = 0.01  # Strong regularization for PROTEINS
           #  print("  Using weight_decay=0.01 for PROTEINS")
-       # elif self.dataset.name == 'AIDS':
+       # elif self.dataset.dataset_name == 'AIDS':
           #  weight_decay = 0.005  # Medium regularization for AIDS
          #   print("  Using weight_decay=0.005 for AIDS")
-      #  elif self.dataset.name == 'Citeseer' and self.task_type == 'link_prediction':
+      #  elif self.dataset.dataset_name == 'Citeseer' and self.task_type == 'link_prediction':
           #  weight_decay = 0.01  # Strong for Citeseer link prediction
          #   print("  Using weight_decay=0.01 for Citeseer link prediction")
        # else:
@@ -1648,7 +1648,7 @@ class GNNFingersDefense(BaseDefense):
 
         # Print results
         print(f"\n{'='*60}")
-        print(f"RESULTS: {self.task_type} on {self.dataset.name}")
+        print(f"RESULTS: {self.task_type} on {self.dataset.dataset_name}")
         print(f"{'='*60}")
         print(f"ARUC: {aruc:.3f}")
         print(f"Best Accuracy: {best_metrics['accuracy']:.3f}")
@@ -1664,5 +1664,5 @@ class GNNFingersDefense(BaseDefense):
             'uniqueness': best_metrics['uniqueness'],
             'threshold': best_metrics['threshold'],
             'task': self.task_type,
-            'dataset': self.dataset.name
+            'dataset': self.dataset.dataset_name
         }
