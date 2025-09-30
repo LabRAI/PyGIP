@@ -11,7 +11,7 @@ The purpose of this example is to hold experimental scripts that reproduce and e
 ## 📂 Structure
 
 ```
-experimenta_examples/
+experimental_examples/
 ├── cli.py            # Command-line interface (entrypoint)
 ├── attacker.py       # Attack + defense logic
 ├── dataset.py        # Dataset loader
