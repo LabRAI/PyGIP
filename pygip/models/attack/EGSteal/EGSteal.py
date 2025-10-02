@@ -6,7 +6,7 @@ from tqdm import tqdm
 from torch.utils.data import random_split
 from .utils import *
 from pygip.models.attack.base import BaseAttack
-from pygip.models.nn import SurrogateModelGraphClassification,TargetModelGraphClassification,GCNGraphClassification,GraphSAGEGraphClassification,GATGraphClassification,GINGraphClassification,Classifier,CAM,GradCAM,GradientExplainer
+from .models import SurrogateModelGraphClassification,TargetModelGraphClassification,GCNGraphClassification,GraphSAGEGraphClassification,GATGraphClassification,GINGraphClassification,Classifier,CAM,GradCAM,GradientExplainer
 import numpy as np
 from torch_geometric.explain import Explainer, GNNExplainer
 import os.path as osp
