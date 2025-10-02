@@ -6,7 +6,7 @@ from .SurviveWM import SurviveWM
 from .SurviveWM2 import SurviveWM2
 from .atom.ATOM import ATOM
 from .Integrity import QueryBasedVerificationDefense as IntegrityVerification
-from .GNNFingers import GNNFingersDefense
+from .gnnfingers import GNNFingersDefense
 from .GrOVe import GroveDefense
 from .Revisiting import Revisiting
 
