@@ -28,31 +28,25 @@ def visualize_and_save_results(all_results):
     dataset_names = [res['name'] for res in all_results]
     n_datasets = len(dataset_names)
 
-    # --- Data Extraction ---
-    # Clean Accuracies
     original_accs = [res['results']['original_metrics']['accuracy'] * 100 for res in all_results]
     tcas = [res['results']['TCA'] * 100 for res in all_results]
     eca1s = [res['results']['s1_metrics']['accuracy'] * 100 for res in all_results]
     eca2s = [res['results']['s2_metrics']['accuracy'] * 100 for res in all_results]
     
-    # Backdoor Accuracies
     tbas = [res['results']['TBA'] * 100 for res in all_results]
     eba1s = [res['results']['EBA1'] * 100 for res in all_results]
     eba2s = [res['results']['EBA2'] * 100 for res in all_results]
 
-    # F1-Scores
     original_f1s = [res['results']['original_metrics']['f1'] for res in all_results]
     defense_f1s = [res['results']['defense_metrics']['f1'] for res in all_results]
     s1_f1s = [res['results']['s1_metrics']['f1'] for res in all_results]
     s2_f1s = [res['results']['s2_metrics']['f1'] for res in all_results]
 
-    # This is for plotting
     x = np.arange(n_datasets)
     width = 0.2
     fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(28, 8))
     fig.suptitle('Comprehensive Backdoor Watermark Analysis', fontsize=20)
 
-    # Subplot 1: Clean Accuracy
     ax1.bar(x - 1.5*width, original_accs, width, label='Baseline (Clean)')
     ax1.bar(x - 0.5*width, tcas, width, label='Watermarked (TCA)')
     ax1.bar(x + 0.5*width, eca1s, width, label='Surrogate w/ Coop (ECA1)')
@@ -64,7 +58,6 @@ def visualize_and_save_results(all_results):
     ax1.legend()
     ax1.grid(axis='y', linestyle='--', alpha=0.7)
 
-    # Subplot 2: Backdoor Accuracy
     ax2.bar(x - width, tbas, width, label='Watermarked (TBA)')
     ax2.bar(x, eba1s, width, label='Surrogate w/ Coop (EBA1)')
     ax2.bar(x + width, eba2s, width, label='Surrogate w/o Coop (EBA2)')
@@ -75,7 +68,6 @@ def visualize_and_save_results(all_results):
     ax2.legend()
     ax2.grid(axis='y', linestyle='--', alpha=0.7)
 
-    # Subplot 3: F1-Score
     ax3.bar(x - 1.5*width, original_f1s, width, label='Baseline (Clean)')
     ax3.bar(x - 0.5*width, defense_f1s, width, label='Watermarked')
     ax3.bar(x + 0.5*width, s1_f1s, width, label='Surrogate w/ Coop')

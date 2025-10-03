@@ -6,9 +6,11 @@ from .SurviveWM import SurviveWM
 from .SurviveWM2 import SurviveWM2
 from .atom.ATOM import ATOM
 from .Integrity import QueryBasedVerificationDefense as IntegrityVerification
+from .graph_pruning import GraphPruningDefense
 
 __all__ = [
     'BackdoorWM',
+    'GraphPruningDefense',
     'ImperceptibleWM',
     'ImperceptibleWM2',
     'RandomWM',

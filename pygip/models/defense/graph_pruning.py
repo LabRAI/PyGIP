@@ -20,24 +20,11 @@ class SimpleGCN(torch.nn.Module):
 class GraphPruningDefense(BaseDefense):
     supported_api_types = {"dgl"}
 
-    def __init__(self, dataset, pruning_ratio=0.1, **kwargs):
-        super().__init__(dataset, **kwargs)
+    def __init__(self, dataset, attack_node_fraction, pruning_ratio=0.1, **kwargs):
+        super().__init__(dataset, attack_node_fraction, **kwargs)
         self.pruning_ratio = pruning_ratio
 
-    def defend(self):
-        """
-        Main public method to execute the defense.
-        It trains the defended model and returns its performance metrics.
-        """
-        defended_acc = self._train_defense_model()
-        
-        return {
-            'defended_accuracy': defended_acc,
-            'pruning_ratio': self.pruning_ratio
-        }
-
-    def _train_gcn_model(self, graph, epochs=100, lr=0.01):
-        """Private helper to train a SimpleGCN model on a given graph."""
+    def _train_gcn_model(self, graph, epochs=100, lr=0.01, return_pred=False):
         graph = graph.to(self.device)
         features = graph.ndata['feat']
         labels = graph.ndata['label']
@@ -58,34 +45,49 @@ class GraphPruningDefense(BaseDefense):
         model.eval()
         with torch.no_grad():
             logits = model(graph, features)
-            pred = logits.argmax(1)
-            accuracy = (pred[test_mask] == labels[test_mask]).float().mean()
-        return accuracy.item()
+            pred = logits.argmax(1).cpu()
+            test_acc = (pred[test_mask].to(labels.device) == labels[test_mask]).float().mean().item()
 
-    def _train_target_model(self):
-        """Trains a baseline model on the original, unmodified graph."""
-        print("   - Training baseline target model...")
+        if return_pred:
+            return test_acc, pred
+        return test_acc
+
+    def defend(self):
+        """
+        Run baseline and pruned models and return ECA and Fidelity.
+        """
         original_graph = dgl.add_self_loop(self.graph_data)
-        accuracy = self._train_gcn_model(original_graph)
-        return accuracy
+        baseline_acc, baseline_pred = self._train_gcn_model(original_graph, return_pred=True)
 
-    def _train_defense_model(self):
-        """Prunes the graph and then trains a new model on the pruned graph."""
-        print(f"   - Training defense model (Pruning ratio: {self.pruning_ratio*100:.1f}%)...")
-        original_graph = self.graph_data
         num_edges_to_remove = int(original_graph.number_of_edges() * self.pruning_ratio)
-        
+        edges_removed = 0
         if num_edges_to_remove > 0:
             all_edge_ids = np.arange(original_graph.number_of_edges())
             edges_to_remove_ids = np.random.choice(all_edge_ids, num_edges_to_remove, replace=False)
             pruned_graph = dgl.remove_edges(original_graph, torch.tensor(edges_to_remove_ids, dtype=torch.int64))
+            edges_removed = len(edges_to_remove_ids)
         else:
             pruned_graph = original_graph
 
         pruned_graph = dgl.add_self_loop(pruned_graph)
-        
-        accuracy = self._train_gcn_model(pruned_graph)
-        return accuracy
+
+        pruned_acc, pruned_pred = self._train_gcn_model(pruned_graph, return_pred=True)
+
+        test_mask = pruned_graph.ndata['test_mask']
+        labels = pruned_graph.ndata['label']
+
+        eca = pruned_acc
+        baseline_on_test = baseline_pred[test_mask]
+        pruned_on_test = pruned_pred[test_mask]
+        fidelity = float((baseline_on_test == pruned_on_test).float().mean().item())
+
+        return {
+            'ECA': eca,
+            'Fidelity': fidelity,
+            'baseline_accuracy': baseline_acc,
+            'pruning_ratio': self.pruning_ratio,
+            'edges_removed': edges_removed
+        }
 
     def _load_model(self):
         pass

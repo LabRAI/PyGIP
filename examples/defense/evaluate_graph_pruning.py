@@ -10,41 +10,37 @@ CONFIG = {
     "attack_node_fraction": 0.2
 }
 
-
-# this all those print statements are used inoreder to provide a visual summary of the results
 def generate_summary_plot(all_results, max_drop_threshold):
     plt.style.use('seaborn-v0_8-whitegrid')
-    fig, ax = plt.subplots(figsize=(12, 8))
+    fig, axs = plt.subplots(len(all_results), 2, figsize=(14, 4 * len(all_results)))
+    if len(all_results) == 1:
+        axs = [axs]
 
-    for dataset_name, results in all_results.items():
-        baseline_acc = results[0.0]
+    for ax_row, (dataset_name, results) in zip(axs, all_results.items()):
         ratios = sorted(results.keys())
-        accuracies = [results[r] for r in ratios]
+        ecas = [results[r]['ECA'] * 100 for r in ratios]
+        fidelities = [results[r]['Fidelity'] * 100 for r in ratios]
+        ratios_percent = [r * 100 for r in ratios]
 
-        break_index = len(accuracies)
-        for i, acc in enumerate(accuracies):
-            if (baseline_acc - acc) > max_drop_threshold:
-                break_index = i + 1
-                break
-        
-        ratios_to_plot = ratios[:break_index]
-        accuracies_to_plot = [acc * 100 for acc in accuracies[:break_index]]
-        ratios_percent = [r * 100 for r in ratios_to_plot]
+        ax_e = ax_row[0]
+        ax_e.plot(ratios_percent, ecas, marker='o', linestyle='-')
+        baseline = results.get(0.0, {}).get('baseline_accuracy', None)
+        if baseline is not None:
+            ax_e.axhline(y=baseline * 100, linestyle='--', label=f'Baseline ({baseline*100:.2f}%)')
+        ax_e.set_title(f'{dataset_name} - Test Accuracy (ECA) vs Pruning Ratio')
+        ax_e.set_xlabel('Pruning Ratio (%)'); ax_e.set_ylabel('Test Accuracy (%)')
+        ax_e.grid(True); ax_e.legend()
 
-        line, = ax.plot(ratios_percent, accuracies_to_plot, marker='o', linestyle='-', label=f'{dataset_name} Accuracy')
-        ax.axhline(y=baseline_acc * 100, color=line.get_color(), linestyle='--', 
-                   label=f'{dataset_name} Baseline ({baseline_acc*100:.2f}%)')
+        ax_f = ax_row[1]
+        ax_f.plot(ratios_percent, fidelities, marker='s', linestyle='-')
+        ax_f.set_title(f'{dataset_name} - Fidelity vs Pruning Ratio')
+        ax_f.set_xlabel('Pruning Ratio (%)'); ax_f.set_ylabel('Fidelity (%)')
+        ax_f.grid(True)
 
-    ax.set_title('Effective Range of Graph Pruning Before Performance Drop', fontsize=16)
-    ax.set_xlabel('Pruning Ratio (%)', fontsize=12)
-    ax.set_ylabel('Test Accuracy (%)', fontsize=12)
-    ax.legend(fontsize=10)
-    ax.grid(True, which='both', linestyle='--', linewidth=0.5)
     plt.tight_layout()
-    save_path = "pruning_effective_range_summary.png"
+    save_path = "pruning_ECA_fidelity_summary.png"
     plt.savefig(save_path, dpi=300)
-    print(f"\n✅ Focused summary plot saved to: {save_path}")
-
+    print(f"\nSummary plot saved to: {save_path}")
 
 def main():
     all_results_for_plot = {}
@@ -61,26 +57,26 @@ def main():
         dataset_class = getattr(datasets, dataset_name)
         dataset = dataset_class()
         
-        baseline_defense = GraphPruningDefense(dataset, 
-                                               pruning_ratio=0.0,
-                                               attack_node_fraction=CONFIG["attack_node_fraction"])
+        baseline_defense = GraphPruningDefense(dataset,attack_node_fraction=["attack_node_fraction"],pruning_ratio=0.0)
         baseline_results = baseline_defense.defend()
-        baseline_accuracy = baseline_results['defended_accuracy']
+        baseline_accuracy = baseline_results['baseline_accuracy']
         print(f"     -> Baseline Accuracy for {dataset_name}: {baseline_accuracy * 100:.2f}%")
         
         print(f"\n   - Sub-step [2/3]: Searching for optimal pruning ratio...")
         current_ratio = CONFIG["initial_pruning_ratio"]
-        run_results = {0.0: baseline_accuracy}
+        run_results = {0.0: baseline_results}
         
         while True:
-            defense = GraphPruningDefense(dataset, 
-                                          pruning_ratio=current_ratio,
-                                          attack_node_fraction=CONFIG["attack_node_fraction"])
+            defense = GraphPruningDefense(dataset,attack_node_fraction=CONFIG["attack_node_fraction"], pruning_ratio=current_ratio)
             results_dict = defense.defend()
-            current_accuracy = results_dict['defended_accuracy']
-            run_results[current_ratio] = current_accuracy
+            run_results[current_ratio] = results_dict
+            current_accuracy = results_dict['ECA']
             accuracy_drop = baseline_accuracy - current_accuracy
 
+            print(f"Using device: {defense.device}")
+            print(f"   -> Metrics for {dataset_name} (ratio={current_ratio*100:.1f}%):")
+            print(f"      ECA: {results_dict['ECA']*100:.2f}% | Fidelity: {results_dict['Fidelity']*100:.2f}% | Edges removed: {results_dict['edges_removed']}")
+            
             if accuracy_drop <= CONFIG["max_accuracy_drop"]:
                 print(f"      -> Success! Drop: {accuracy_drop*100:.2f}%. Continuing search.")
                 current_ratio = round(current_ratio + CONFIG["pruning_step"], 2)
@@ -95,24 +91,24 @@ def main():
 
         print(f"\n   - Sub-step [3/3]: Optimal Pruning Results for {dataset_name}")
         optimal_ratio = 0.0
-        optimal_accuracy = baseline_accuracy
-        for ratio, acc in run_results.items():
-            if (baseline_accuracy - acc) <= CONFIG["max_accuracy_drop"] and ratio > optimal_ratio:
+        optimal_metrics = baseline_results
+        for ratio, metrics in run_results.items():
+            if (baseline_accuracy - metrics['ECA']) <= CONFIG["max_accuracy_drop"] and ratio > optimal_ratio:
                 optimal_ratio = ratio
-                optimal_accuracy = acc
+                optimal_metrics = metrics
         
         print("     " + "="*60)
         print(f"      Baseline Accuracy:         {baseline_accuracy * 100:.2f}%")
         print(f"      Acceptable Accuracy Drop:  < {CONFIG['max_accuracy_drop'] * 100:.2f}%")
         print("     " + "-" * 60)
         print(f"      Optimal Pruning Ratio:     {optimal_ratio * 100:.1f}%")
-        print(f"      Accuracy at this Ratio:    {optimal_accuracy * 100:.2f}%")
-        print(f"      Final Accuracy Drop:       {(baseline_accuracy - optimal_accuracy) * 100:.2f}%")
+        print(f"      Accuracy at this Ratio:    {optimal_metrics['ECA'] * 100:.2f}%")
+        print(f"      Fidelity at this Ratio:    {optimal_metrics['Fidelity'] * 100:.2f}%")
+        print(f"      Edges removed:             {optimal_metrics['edges_removed']}")
         print("     " + "="*60)
 
-    step_num = num_total_steps
     print("\n" + "="*80)
-    print(f"      STEP [{step_num}/{num_total_steps}]: Generating Overall Summary Plot")
+    print(f"      STEP [{num_total_steps}/{num_total_steps}]: Generating Overall Summary Plot")
     print("="*80)
     generate_summary_plot(all_results_for_plot, CONFIG["max_accuracy_drop"])
     print("="*80)
