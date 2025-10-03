@@ -94,3 +94,4 @@ class GraphPruningDefense(BaseDefense):
 
     def _train_surrogate_model(self):
         pass
+
