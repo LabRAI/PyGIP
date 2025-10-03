@@ -7,6 +7,10 @@ from .SurviveWM2 import SurviveWM2
 from .atom.ATOM import ATOM
 from .Integrity import QueryBasedVerificationDefense as IntegrityVerification
 from .graph_pruning import GraphPruningDefense
+from .gnnfingers import GNNFingersDefense
+from .GrOVe import GroveDefense
+from .Revisiting import Revisiting
+
 
 __all__ = [
     'BackdoorWM',
@@ -16,5 +20,9 @@ __all__ = [
     'RandomWM',
     'SurviveWM',
     'SurviveWM2',
-    'ATOM'
+    'ATOM',
+    'GNNFingersDefense',
+    'IntegrityVerification',
+    'GroveDefense',
+    'Revisiting',
 ]

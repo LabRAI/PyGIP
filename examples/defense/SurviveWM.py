@@ -6,12 +6,10 @@ from pygip.models.defense import SurviveWM
 # TODO test gpu
 # TODO verify performance
 # TODO record metrics (original acc, defense acc, fidelity)
-# TODO verification after attack on defense
-# TODO record metrics (AUC[watermark], Acc[fingerprint])
 
 def survivewm():
     dataset = Cora(api_type='dgl')
-    med = SurviveWM(dataset, attack_node_fraction=0.1)
+    med = SurviveWM(dataset, defense_ratio=0.1)
     med.defend()
 
 

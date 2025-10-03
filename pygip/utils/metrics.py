@@ -1,54 +1,47 @@
 from abc import ABC, abstractmethod
+from typing import List, Dict
 
-import torch
-from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score, roc_auc_score
+import numpy as np
+from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score
 
 
 class MetricBase(ABC):
     def __init__(self):
         self.preds = []
         self.labels = []
-        self.reset()
 
     @abstractmethod
-    def update(self, preds, labels, **kwargs):
+    def update(self, *args, **kwargs) -> None:
         """Update internal metric state."""
         pass
 
     @abstractmethod
-    def compute(self):
+    def compute(self) -> Dict[str, float]:
         """Compute and return all metric results."""
         pass
 
-    @abstractmethod
-    def reset(self):
+    def reset(self) -> None:
         """Reset internal state."""
         self.preds = []
         self.labels = []
 
     @staticmethod
-    def compute_default_metrics(preds, labels):
+    def _cat_to_numpy(a: List) -> np.ndarray:
+        if len(a) == 0:
+            raise ValueError("Empty tensor list, nothing to compute.")
+        return torch.cat(a).cpu().numpy()
+
+    def compute_default_metrics(self, preds, labels) -> Dict[str, float]:
+        preds = self._cat_to_numpy(preds)
+        labels = self._cat_to_numpy(labels)
         return {
             'Acc': accuracy_score(labels, preds),
             'F1': f1_score(labels, preds, average='macro'),
             'Precision': precision_score(labels, preds, average='macro'),
             'Recall': recall_score(labels, preds, average='macro'),
-            'AUROC': roc_auc_score(labels, preds, multi_class='ovr')
         }
 
-    @staticmethod
-    def compute_fidelity(output1, output2):
-        return {
-            'Fidelity': (output1.argmax(dim=1) == output2.argmax(dim=1)).float().mean().item()
-        }
-
-    @staticmethod
-    def compute_auc(preds, labels):
-        return {
-            'AUC': roc_auc_score(labels, preds)
-        }
-
-    def print(self):
+    def __repr__(self):
         results = self.compute()
         for name, value in results.items():
             print(f"{name}: {value:.4f}")
@@ -57,60 +50,178 @@ class MetricBase(ABC):
 class AttackMetric(MetricBase):
     def __init__(self):
         super().__init__()
+        self.query_label = []
+        self.reset()
 
-    def update(self, preds, labels, target_outputs=None, surrogate_outputs=None):
+    def reset(self) -> None:
+        super().reset()
+        self.query_label = []
+
+    def update(self, preds, labels, query_label):
         self.preds.append(preds.detach().cpu())
         self.labels.append(labels.detach().cpu())
+        self.query_label.append(query_label.detach().cpu())
+
+    def compute_fidelity(self, preds_label, query_label) -> Dict[str, float]:
+        preds_label = self._cat_to_numpy(preds_label)
+        query_label = self._cat_to_numpy(query_label)
+        return {
+            'Fidelity': (preds_label == query_label).astype(float).mean().item()
+        }
 
     def compute(self):
-        preds = torch.cat(self.preds).numpy()
-        labels = torch.cat(self.labels).numpy()
-        results = self.compute_default_metrics(preds, labels)
+        defaults = self.compute_default_metrics(self.preds, self.labels)
+        fidelity = self.compute_fidelity(self.preds, self.query_label)
+        results = defaults | fidelity
+        print(f"acc: {results['Acc']:.4f}, fidelity: {results['Fidelity']:.4f}")
         return results
 
 
 class DefenseMetric(MetricBase):
     def __init__(self):
         super().__init__()
-        self.target_preds = []
-        self.target_labels = []
-        self.surrogate_outputs = []
+        self.wm_preds = []
+        self.wm_label = []
+        self.reset()
 
-    def update_target(self, target_preds, target_labels):
-        ...
-
-    def update_defense_task(self, defense_preds, defense_labels):
-        ...
-
-    def update_defense_wm(self, wm_preds, wm_labels):
-        ...
-
-    def update_surrogate_task(self, surrogate_preds, surrogate_labels):
-        ...
-
-    def update_surrogate_wm(self, wm_preds, wm_labels):
-        ...
-
-    def update(self, preds, labels, target_outputs=None, surrogate_outputs=None):
+    def update(self, preds, labels):
         self.preds.append(preds.detach().cpu())
         self.labels.append(labels.detach().cpu())
 
+    def reset(self) -> None:
+        super().reset()
+        self.wm_preds = []
+        self.wm_label = []
+
+    def update_wm(self, wm_preds, wm_label):
+        self.wm_preds.append(wm_preds.detach().cpu())
+        self.wm_label.append(wm_label.detach().cpu())
+
+    def compute_wm(self):
+        wm_preds = self._cat_to_numpy(self.wm_preds)
+        wm_label = self._cat_to_numpy(self.wm_label)
+        return {"WM Acc": accuracy_score(wm_label, wm_preds)}
+
     def compute(self):
-        preds = torch.cat(self.preds).numpy()
-        labels = torch.cat(self.labels).numpy()
-        results = self.compute_default_metrics(preds, labels)
+        defaults = self.compute_default_metrics(self.preds, self.labels)
+        wm_acc = self.compute_wm()
+        results = defaults | wm_acc
+        print(f"acc: {results['Acc']:.4f}, wm acc: {results['WM Acc']:.4f}")
         return results
 
 
-class ComputationMetric:
-    def __init__(self):
-        self.train_time = []
-        self.inference_time = []
-        self.verification_time = []
-        self.gpu_mem = []
+import torch
+import numpy as np
+import time
 
-    def update(self):
-        ...
+
+class AttackCompMetric:
+    def __init__(self, gpu_count=None):
+        self.train_target_time = []
+        self.query_target_time = []
+        self.train_surrogate_time = []
+        self.inference_surrogate_time = []
+        self.attack_time = []
+
+        self.start_time = 0
+        self.total_time = 0
+
+        self.gpu_count = gpu_count or (1 if torch.cuda.is_available() else 0)
+
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
+
+    def start(self):
+        self.start_time = time.time()
+
+    def end(self):
+        self.total_time = time.time() - self.start_time
+
+    def update(self, train_target_time=None, query_target_time=None, train_surrogate_time=None, attack_time=None,
+               inference_surrogate_time=None):
+        if train_target_time is not None:
+            self.train_target_time.append(train_target_time)
+        if query_target_time is not None:
+            self.query_target_time.append(query_target_time)
+        if train_surrogate_time is not None:
+            self.train_surrogate_time.append(train_surrogate_time)
+        if attack_time is not None:
+            self.attack_time.append(attack_time)
+        if inference_surrogate_time is not None:
+            self.inference_surrogate_time.append(inference_surrogate_time)
+
+    def compute(self):
+        peak_mem = 0
+        if torch.cuda.is_available():
+            peak_mem = torch.cuda.max_memory_allocated() / (1024 ** 3)  # GB
+
+        gpu_hours = (self.total_time / 3600.0) * self.gpu_count
+
+        print(
+            f"attack time: {np.mean(self.attack_time):.4f}, inference time: {np.mean(self.inference_surrogate_time):.4f}, gpu mem: {peak_mem:.4f}, gpu hours: {gpu_hours:.4f}")
+
+        return {
+            'train_target_time': np.mean(self.train_target_time),
+            'query_target_time': np.mean(self.query_target_time),
+            'train_surrogate_time': np.mean(self.train_surrogate_time),
+            'attack_time': np.mean(self.attack_time),
+            'inference_surrogate_time': np.mean(self.inference_surrogate_time),
+            'total_time': self.total_time,
+            'peak_gpu_mem(GB)': peak_mem,
+            'gpu_hours': gpu_hours
+        }
+
+
+class DefenseCompMetric:
+    def __init__(self, gpu_count=None):
+        self.train_target_time = []
+        self.train_defense_time = []
+        self.inference_defense_time = []
+        self.defense_time = []
+
+        self.start_time = 0
+        self.total_time = 0
+
+        self.gpu_count = gpu_count or (1 if torch.cuda.is_available() else 0)
+
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
+
+    def start(self):
+        self.start_time = time.time()
+
+    def end(self):
+        self.total_time = time.time() - self.start_time
+
+    def update(self, train_target_time=None, train_defense_time=None, inference_defense_time=None, defense_time=None):
+        if train_target_time is not None:
+            self.train_target_time.append(train_target_time)
+        if train_defense_time is not None:
+            self.train_defense_time.append(train_defense_time)
+        if inference_defense_time is not None:
+            self.inference_defense_time.append(inference_defense_time)
+        if defense_time is not None:
+            self.defense_time.append(defense_time)
+
+    def compute(self):
+        peak_mem = 0
+        if torch.cuda.is_available():
+            peak_mem = torch.cuda.max_memory_allocated() / (1024 ** 3)  # GB
+
+        gpu_hours = (self.total_time / 3600.0) * self.gpu_count
+
+        print(
+            f"defense time: {np.mean(self.defense_time):.4f}, inference time: {np.mean(self.inference_defense_time):.4f}, gpu mem: {peak_mem:.4f}, gpu hours: {gpu_hours:.4f}")
+
+        return {
+            'train_target_time': np.mean(self.train_target_time),
+            'train_defense_time': np.mean(self.train_defense_time),
+            'inference_defense_time': np.mean(self.inference_defense_time),
+            'defense_time': np.mean(self.defense_time),
+            'total_time': self.total_time,
+            'peak_gpu_mem(GB)': peak_mem,
+            'gpu_hours': gpu_hours
+        }
 
 
 class GraphNeuralNetworkMetric:

@@ -1347,12 +1347,20 @@ def attack0(dataset_name, seed, cuda, attack_node_arg=0.25, file_path='', LR=1e-
 
 from pygip.models.attack.base import BaseAttack
 from pygip.datasets import Dataset
-
+from pygip.utils.metrics import AttackMetric, AttackCompMetric
 
 class CEGA(BaseAttack):
     supported_api_types = {"dgl"}
 
-    def __init__(self, dataset: Dataset, attack_node_fraction: float, model_path: str = None):
+    # ====== only signature and stored params are changed here ======
+    def __init__(
+        self,
+        dataset: Dataset,
+        attack_node_fraction: float,
+        model_path: str = None,
+        attack_x_ratio: float = 1.0,
+        attack_a_ratio: float = 1.0,
+    ):
         super(CEGA, self).__init__(dataset, attack_node_fraction, model_path)
         # graph data
         self.dataset = dataset
@@ -1367,15 +1375,42 @@ class CEGA(BaseAttack):
         self.label_number = dataset.num_classes
         self.attack_node_number = int(dataset.num_nodes * attack_node_fraction)
         self.attack_node_fraction = attack_node_fraction
+        # new visibility knobs for inputs (kept for consistency across attacks)
+        self.attack_x_ratio = float(attack_x_ratio)
+        self.attack_a_ratio = float(attack_a_ratio)
 
-    def attack(self, seed=1, cuda=None, LR=1e-3, TGT_LR=1e-2,
-               EVAL_EPOCH=10, TGT_EPOCH=10, WARMUP_EPOCH=4, dropout=False, model_performance=True, **kwargs):
+    def attack(
+        self,
+        seed=1,
+        cuda=None,
+        LR=1e-3,
+        TGT_LR=1e-2,
+        EVAL_EPOCH=10,
+        TGT_EPOCH=10,
+        WARMUP_EPOCH=4,
+        dropout=False,
+        model_performance=True,
+        **kwargs
+    ):
+        """
+        Returns
+        -------
+        perf_json : dict
+            Performance metrics (JSON-serialisable): accuracy/fidelity/F1 of the surrogate,
+            and optionally target accuracy/F1 for reference.
+        comp_json : dict
+            Computation metrics (JSON-serialisable): attack_time, query_target_time, train_surrogate_time, etc.
+        """
+        # ===== metrics collection (computation) =====
+        attack_time_start = time.time()
+        query_target_time = 0.0
+        train_surrogate_time = 0.0
+
         # Initialization
-        # device = 'cpu'
         set_seed(seed)
         metrics_df = pd.DataFrame(columns=['Num Attack Nodes', 'Method', 'Test Accuracy', 'Test Fidelity'])
 
-        # g, features, labels, node_number, train_mask, test_mask = load_data(dataset_name)
+        # data handles
         g = self.graph
         features = self.features
         labels = self.labels
@@ -1384,7 +1419,6 @@ class CEGA(BaseAttack):
         test_mask = self.test_mask
 
         attack_node_arg = self.attack_node_fraction
-
         attack_node_number = int(node_number * attack_node_arg)
         feature_number = features.shape[1]
         label_number = len(labels.unique())
@@ -1396,54 +1430,47 @@ class CEGA(BaseAttack):
         degs = g.in_degrees().float()
         norm = th.pow(degs, -0.5)
         norm[th.isinf(norm)] = 0
-        if cuda != None:
+        if cuda is not None:
             norm = norm.cuda()
         g.ndata['norm'] = norm.unsqueeze(1)
-        if dropout == True:
+        if dropout:
             gcn_Net = GCN_drop(feature_number, label_number)
         else:
             gcn_Net = GcnNet(feature_number, label_number)
         optimizer = th.optim.Adam(gcn_Net.parameters(), lr=TGT_LR, weight_decay=5e-4)
         dur = []
 
-        ## Send the training to cuda
+        # Send the training to device
         features = features.to(self.device)
         gcn_Net = gcn_Net.to(self.device)
         train_mask = train_mask.to(self.device)
         test_mask = test_mask.to(self.device)
         labels = labels.to(self.device)
-        target_performance = {
-            'acc': 0,
-            'f1score': 0
-        }
+        target_performance = {'acc': 0, 'f1score': 0}
 
         print("=========Target Model Generating==========================")
+        # train target model
+        tgt_train_t0 = time.time()
         for epoch in range(TGT_EPOCH):
             if epoch >= 3:
                 t0 = time.time()
-
             gcn_Net.train()
             logits = gcn_Net(g, features)
             logp = F.log_softmax(logits, 1)
             loss = F.nll_loss(logp[train_mask], labels[train_mask])
-
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
-
             if epoch >= 3:
                 dur.append(time.time() - t0)
-
             acc, f1score = evaluate(gcn_Net, g, features, labels, test_mask)
-            if acc > target_performance['acc']:
-                target_performance['acc'] = acc
-            if f1score > target_performance['f1score']:
-                target_performance['f1score'] = f1score
-
+            target_performance['acc'] = max(target_performance['acc'], acc)
+            target_performance['f1score'] = max(target_performance['f1score'], f1score)
             print("Epoch {:05d} | Loss {:.4f} | Test Acc {:.4f} | Test F1 macro {:.4f} | Time(s) {:.4f}".format(
                 epoch, loss.item(), acc, f1score, np.mean(dur)))
+        train_surrogate_time += (time.time() - tgt_train_t0)
 
-        ## Get the cuda-trained data back
+        # move tensors back to cpu for subgraph building
         g = g.cpu()
         features = features.cpu()
         gcn_Net = gcn_Net.cpu()
@@ -1453,15 +1480,11 @@ class CEGA(BaseAttack):
 
         # Generate sub-graph index
         alpha = 0.8
-        sub_graph_node_index = []
-        for i in range(attack_node_number):
-            sub_graph_node_index.append(random.randint(0, node_number - 1))
-
+        sub_graph_node_index = [random.randint(0, node_number - 1) for _ in range(attack_node_number)]
         sub_labels = labels[sub_graph_node_index]
 
         syn_nodes = []
         g_matrix = np.asmatrix(g.adjacency_matrix().to_dense())
-
         for node_index in sub_graph_node_index:
             # get nodes
             one_step_node_index = g_matrix[node_index, :].nonzero()[1].tolist()
@@ -1475,7 +1498,6 @@ class CEGA(BaseAttack):
 
         # Generate features for SubGraph attack
         np_features_query = features.clone()
-
         for node_index in sub_graph_syn_node_index:
             # initialized as zero
             np_features_query[node_index] = np_features_query[node_index] * 0
@@ -1486,34 +1508,30 @@ class CEGA(BaseAttack):
             total_two_step_node_index = []
             num_one_step = len(one_step_node_index)
             for first_order_node_index in one_step_node_index:
-                # caculate the feature: features =  0.8 * average_one + 0.8^2 * average_two
-                # new_array = features[first_order_node_index]*0.8/num_one_step
+                # features = 0.8 * average_one / sqrt(num_one_step * deg)
                 this_node_degree = len(g_matrix[first_order_node_index, :].nonzero()[1].tolist())
                 x1 = np_features_query[node_index]
-                x2 = features[first_order_node_index] * alpha / math.sqrt(num_one_step * this_node_degree)
-
+                x2 = features[first_order_node_index] * alpha / math.sqrt(max(1, num_one_step * this_node_degree))
                 np_features_query[node_index] = x1 + x2
 
                 two_step_node_index = g_matrix[first_order_node_index, :].nonzero()[1].tolist()
                 total_two_step_node_index = list(
-                    set(total_two_step_node_index + two_step_node_index) - set(one_step_node_index))
+                    set(total_two_step_node_index + two_step_node_index) - set(one_step_node_index)
+                )
             total_two_step_node_index = list(set(total_two_step_node_index).intersection(set(sub_graph_node_index)))
 
             num_two_step = len(total_two_step_node_index)
             for second_order_node_index in total_two_step_node_index:
-
-                # caculate the feature: features =  0.8 * average_one + 0.8^2 * average_two
                 this_node_second_step_nodes = []
                 this_node_first_step_nodes = g_matrix[second_order_node_index, :].nonzero()[1].tolist()
                 for nodes_in_this_node in this_node_first_step_nodes:
                     this_node_second_step_nodes = list(
-                        set(this_node_second_step_nodes + g_matrix[nodes_in_this_node, :].nonzero()[1].tolist()))
+                        set(this_node_second_step_nodes + g_matrix[nodes_in_this_node, :].nonzero()[1].tolist())
+                    )
                 this_node_second_step_nodes = list(set(this_node_second_step_nodes) - set(this_node_first_step_nodes))
-
                 this_node_second_degree = len(this_node_second_step_nodes)
                 x1 = np_features_query[node_index]
-                x2 = features[first_order_node_index] * alpha / math.sqrt(num_one_step * this_node_degree)
-
+                x2 = features[first_order_node_index] * alpha / math.sqrt(max(1, num_one_step * this_node_degree))
                 np_features_query[node_index] = x1 + x2
 
         features_query = th.FloatTensor(np_features_query)
@@ -1537,7 +1555,6 @@ class CEGA(BaseAttack):
                 train_mask[i] = 0
 
         sub_train_mask = train_mask[total_sub_nodes]
-
         sub_features = features_query[total_sub_nodes]
         sub_labels = labels[total_sub_nodes]
 
@@ -1548,55 +1565,47 @@ class CEGA(BaseAttack):
 
         gcn_Net.eval()
 
-        # =================Generate Label===================================================
+        # =================Generate Label========================
+        # timing: query the target once for labels on query set
+        qt0 = time.time()
         logits_query = gcn_Net(g, features)
         _, labels_query = th.max(logits_query, dim=1)
+        query_target_time += (time.time() - qt0)
 
         sub_labels_query = labels_query[total_sub_nodes]
         sub_g = nx.from_numpy_array(sub_g)
-
         sub_g.remove_edges_from(nx.selfloop_edges(sub_g))
         sub_g.add_edges_from(zip(sub_g.nodes(), sub_g.nodes()))
-
-        sub_g = dgl.from_networkx(sub_g)  # sub_g = DGLGraph(sub_g)
-        n_edges = sub_g.number_of_edges()
+        sub_g = dgl.from_networkx(sub_g)
         # normalization
         degs = sub_g.in_degrees().float()
         norm = th.pow(degs, -0.5)
         norm[th.isinf(norm)] = 0
-
         sub_g.ndata['norm'] = norm.unsqueeze(1)
 
         print("=========Model Extracting==========================")
 
-        # hyperparameters get from kwargs
-        # no need to change these default for now
+        # hyperparameters from kwargs
         num_perturbations = kwargs.get('num_perturbations', 100)
         noise_level = kwargs.get('noise_level', 0.05)
         rho = kwargs.get('rho', 0.8)
         num_each = kwargs.get('num_each', 1)
         epochs_per_cycle = kwargs.get('epochs_per_cycle', 1)
         setup = kwargs.get('setup', "experiment")
-        # This need to be relatively bigger to allow for more accurate classification
         if_warmup = kwargs.get('if_warmup', False)
         LR_CEGA = kwargs.get('LR_CEGA', 1e-2)
-        # Tuning parameters for adaptive weight in each of the CEGA iteration
-        # Default works for cora and amazonphoto and coauthorCS
-        # Need specific modification for citeseer and pubmed
         curve = kwargs.get('curve', 0.3)
         init_1 = kwargs.get('init_1', 0.2)
         init_2 = kwargs.get('init_2', 0.2)
         init_3 = kwargs.get('init_3', 0.2)
         gap = kwargs.get('gap', 0.6)
 
-        # Derivative parameters
+        # derivative params
         num_node = sub_features.shape[0]
         total_epochs = epochs_per_cycle * 18 * C_var
         total_num = 20 * C_var
         num_cycles = total_epochs // epochs_per_cycle
 
-        # Set up adaptive weights: set the numbers then reweight them
-        # For citeseer, try k = 0.5, init_1 = 0.3. The other parameters seem to be working fine
         cycles = np.linspace(0, 1, num_cycles)
         index_1 = init_1 + gap * np.exp(-1 * curve * cycles)
         index_2 = init_2 + gap * (1 - np.exp(-1 * curve * cycles))
@@ -1606,120 +1615,88 @@ class CEGA(BaseAttack):
         index_2 /= total
         index_3 /= total
 
-        # create GCN model
+        # create surrogate model
         max_acc1 = 0
         max_acc2 = 0
         max_f1 = 0
         dur = []
 
-        if dropout == True:
-            net = GCN_drop(feature_number, label_number)
-        else:
-            net = GcnNet(feature_number, label_number)
+        net = GCN_drop(feature_number, label_number) if dropout else GcnNet(feature_number, label_number)
         optimizer = th.optim.Adam(net.parameters(), lr=LR_CEGA, weight_decay=5e-4)
 
-        ## Set up initial set which is iteratively progressive
+        # initial training set
         train_inits = init_mask(C_var, sub_train_mask, sub_labels)
         train_inits_tensor = th.tensor(train_inits)
         sub_train_mask_new = th.zeros(len(sub_train_mask), dtype=th.bool)
         sub_train_mask_new[train_inits] = True
-
-        ## Record the initial nodes in torch object
         nodes_queried = th.tensor([], dtype=th.long)
         nodes_queried = th.cat((nodes_queried, train_inits_tensor))
 
-        ## Do warm up if that is ever an option
-        if if_warmup == True:
+        # warmup
+        if if_warmup:
             sub_train_mask_warmup = th.zeros(len(sub_train_mask), dtype=th.bool)
             sub_train_mask_warmup[train_inits] = True
             net.train()
-
+            warm_s = time.time()
             for epoch in range(WARMUP_EPOCH):
                 logits = net(sub_g, sub_features)
                 logp = F.log_softmax(logits, dim=1)
-
                 loss = F.nll_loss(logp[sub_train_mask_warmup], sub_labels_query[sub_train_mask_warmup])
-
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
                 acc, f1score = evaluate(net, g, features, labels, test_mask)
                 print("Epoch {:05d} | Loss {:.4f} | Test Acc {:.4f} | Test F1 score {:.4f}".format(
                     epoch + 1, loss.item(), acc, f1score))
-
+            train_surrogate_time += (time.time() - warm_s)
             net.eval()
 
-        ## Now start timing when the real cycles begin
-        start_time = time.time()
-        # log_dir = f"{file_path}/timelogs/{dataset_name}/logtime_cega_{seed}"
-        # os.makedirs(os.path.dirname(log_dir), exist_ok=True)
-
+        # cycles
         print("=========Learn a node in each cycle==========================")
-
-        # Learn a node in each cycle
+        cycle_train_s = time.time()
         for cycle in range(num_cycles):
             net.train()
-
             for epoch in range(epochs_per_cycle):
                 logits = net(sub_g, sub_features)
-
-                ## Need to get new sub_train_mask
                 logp = F.log_softmax(logits, dim=1)
                 loss = F.nll_loss(logp[sub_train_mask_new], sub_labels_query[sub_train_mask_new])
-
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
 
-                acc1, _ = evaluate(net, g, features, labels_query, test_mask)
+                acc1, _ = evaluate(net, g, features, labels_query, test_mask)  # fidelity proxy
                 acc2, f1score = evaluate(net, g, features, labels, test_mask)
-                if acc1 > max_acc1:
-                    max_acc1 = acc1
-                if acc2 > max_acc2:
-                    max_acc2 = acc2
-                if f1score > max_f1:
-                    max_f1 = f1score
-                # Add f1 in output
+                max_acc1 = max(max_acc1, acc1)
+                max_acc2 = max(max_acc2, acc2)
+                max_f1 = max(max_f1, f1score)
                 print(
                     "Cycle {:05d} | Epoch {:05d} | Loss {:.4f} | Test Acc {:.4f} | Test Fid {:.4f} | Test F1score {:.4f} ".format(
                         cycle + 1, epoch + 1 + cycle * epochs_per_cycle, loss.item(), acc2, acc1, max_f1))
 
             net.eval()
-
-            # Update the sub_train_mask using your specially-designed algorithm
             if sub_train_mask_new.sum() < total_num:
-                # Random
                 if setup == "random":
                     print("Setup: Random")
-                    # Add the entry to the node pool nodes_queried on the supposed order
                     node_queried = update_sub_train_mask(num_each, sub_train_mask, sub_train_mask_new)
                     node_queried_tensor = th.tensor(node_queried)
-                    # node_queried_tensor = th.tensor(node_queried, dtype = th.long)
                     nodes_queried = th.cat((nodes_queried, node_queried_tensor))
                     sub_train_mask_new[node_queried] = True
-
                 elif setup == "experiment":
                     print("Setup: Experiment")
-                    ## First: Representativeness
-                    ## Can be replaced by other centrality measurement
                     Rank1 = rank_centrality(sub_g, sub_train_mask, sub_train_mask_new, num_each, return_rank=True)
-                    ## Second: Uncertainty
                     Rank2 = rank_entropy(net, sub_g, sub_features, sub_train_mask, sub_train_mask_new,
                                          num_each, return_rank=True)
-                    ## Third: Diversity
                     Rank3 = rank_diversity(net, sub_g, sub_features, sub_train_mask, sub_train_mask_new,
                                            num_each, C_var, rho, return_rank=True)
-
                     if Rank1 is None:
                         print("Completed!")
-                    selected_indices = quantile_selection(Rank1, Rank2, Rank3, index_1[cycle], index_2[cycle],
-                                                          index_3[cycle],
-                                                          sub_train_mask, sub_train_mask_new, num_each)
+                    selected_indices = quantile_selection(
+                        Rank1, Rank2, Rank3, index_1[cycle], index_2[cycle], index_3[cycle],
+                        sub_train_mask, sub_train_mask_new, num_each
+                    )
                     selected_indices_tensor = selected_indices.clone().detach()
-                    # th.tensor(, dtype = th.long)
                     nodes_queried = th.cat((nodes_queried, selected_indices_tensor))
                     sub_train_mask_new[selected_indices] = True
-
                 elif setup == "perturbation":
                     print("Setup: Experiment with Perturbation")
                     Rank1 = rank_centrality(sub_g, sub_train_mask, sub_train_mask_new, num_each, return_rank=True)
@@ -1728,12 +1705,12 @@ class CEGA(BaseAttack):
                                          num_each, return_rank=True)
                     Rank3 = rank_diversity(net, sub_g, sub_features, sub_train_mask, sub_train_mask_new,
                                            num_each, C_var, rho, return_rank=True)
-
                     if Rank1 is None:
                         print("Completed!")
-                    selected_indices = quantile_selection(Rank1, Rank2, Rank3, index_1[cycle], index_2[cycle],
-                                                          index_3[cycle],
-                                                          sub_train_mask, sub_train_mask_new, num_each)
+                    selected_indices = quantile_selection(
+                        Rank1, Rank2, Rank3, index_1[cycle], index_2[cycle], index_3[cycle],
+                        sub_train_mask, sub_train_mask_new, num_each
+                    )
                     selected_indices_tensor = selected_indices.clone().detach()
                     nodes_queried = th.cat((nodes_queried, selected_indices_tensor))
                     sub_train_mask_new[selected_indices] = True
@@ -1742,28 +1719,13 @@ class CEGA(BaseAttack):
                     return 1
             else:
                 print("Move on with designated nodes!")
-                sub_train_mask_new = sub_train_mask_new
-
-        ## Record time for all these cycles when the loop is complete
-        # node_selection_time = time.time() - start_time
-        # with open(log_dir, 'a') as log_file:
-        #     log_file.write(f"CEGA {dataset_name} {seed} ")
-        #     log_file.write(f"{node_selection_time:.4f}s\n")
+        train_surrogate_time += (time.time() - cycle_train_s)
 
         idx_train = nodes_queried.tolist()
-
-        output_data = {
-            'total_sub_nodes': total_sub_nodes,
-            'idx_train': idx_train
-        }
-
-        ## Assertation and printing
-        # assert len(idx_train) == 20 * C_var
+        output_data = {'total_sub_nodes': total_sub_nodes, 'idx_train': idx_train}
         print('node selection finished')
-        # with open(f'./node_selection/CEGA_{setup}_{dataset_name}_selected_nodes_{(20 * label_number)}_{seed}.json',
-        #           'w') as f:
-        #     json.dump(output_data, f)
 
+        # move to device for evaluation/training-from-scratch
         sub_g = sub_g.to(self.device)
         sub_features = sub_features.to(self.device)
         sub_labels_query = sub_labels_query.to(self.device)
@@ -1777,52 +1739,35 @@ class CEGA(BaseAttack):
         if model_performance:
             for iter in range(2 * C_var, 21 * C_var, C_var):
                 set_seed(seed)
-
-                ## Create net from scratch
-                if dropout == True:
-                    net_scratch = GCN_drop(feature_number, label_number)
-                else:
-                    net_scratch = GcnNet(feature_number, label_number)
+                net_scratch = GCN_drop(feature_number, label_number) if dropout else GcnNet(feature_number, label_number)
                 optimizer = th.optim.Adam(net_scratch.parameters(), lr=LR, weight_decay=5e-4)
-
-                ## set up training nodes and send them to device
                 sub_train_scratch = th.zeros(sub_features.size()[0], dtype=th.bool)
                 sub_train_scratch[idx_train[:iter]] = True
                 sub_train_scratch = sub_train_scratch.to(self.device)
                 net_scratch = net_scratch.to(self.device)
-
-                ## Reset data
                 max_acc1 = 0
                 max_acc2 = 0
                 max_f1 = 0
                 dur = []
-
+                eval_train_s = time.time()
                 for epoch in range(EVAL_EPOCH):
                     if epoch >= 3:
                         t0 = time.time()
-
                     net_scratch.train()
                     logits = net_scratch(sub_g, sub_features)
                     logp = F.log_softmax(logits, dim=1)
                     loss = F.nll_loss(logp[sub_train_scratch], sub_labels_query[sub_train_scratch])
-
                     optimizer.zero_grad()
                     loss.backward()
                     optimizer.step()
-
                     if epoch >= 3:
                         dur.append(time.time() - t0)
-
                     acc1, _ = evaluate(net_scratch, g, features, labels_query, test_mask)
                     acc2, f1score = evaluate(net_scratch, g, features, labels, test_mask)
-                    if acc1 > max_acc1:
-                        max_acc1 = acc1
-                    if acc2 > max_acc2:
-                        max_acc2 = acc2
-                    if f1score > max_f1:
-                        max_f1 = f1score
-
-                # Output Epoch Scores
+                    max_acc1 = max(max_acc1, acc1)
+                    max_acc2 = max(max_acc2, acc2)
+                    max_f1 = max(max_f1, f1score)
+                train_surrogate_time += (time.time() - eval_train_s)
                 epoch_metrics = pd.DataFrame({
                     'Num Attack Nodes': [iter],
                     'Method': ['CEGA'],
@@ -1831,11 +1776,8 @@ class CEGA(BaseAttack):
                     'Test F1score': [max_f1],
                 })
                 metrics_df = pd.concat([metrics_df, epoch_metrics], ignore_index=True)
-
                 print("Test Acc {:.4f} | Test Fid {:.4f} | Test F1score {:.4f} | Time(s) {:.4f}".format(
                     acc2, acc1, max_f1, np.mean(dur)))
-
-            ## Should this be 'f1score'?
             epoch_metrics = pd.DataFrame({
                 'Num Attack Nodes': [int(th.sum(train_mask))],
                 'Method': ['CEGA'],
@@ -1845,73 +1787,74 @@ class CEGA(BaseAttack):
             })
             metrics_df = pd.concat([metrics_df, epoch_metrics], ignore_index=True)
 
-            # log_file_path = f"{file_path}/{dataset_name}/log_cega_{seed}.csv"
-            # metrics_df.to_csv(log_file_path, mode='w', header=False, index=False)
+        # train a surrogate on all selected nodes for final report
+        set_seed(seed)
+        net_full = GCN_drop(feature_number, label_number) if dropout else GcnNet(feature_number, label_number)
+        optimizer_full = th.optim.Adam(net_full.parameters(), lr=LR, weight_decay=5e-4)
+        net_full = net_full.to(self.device)
+        net = net.to(self.device)
+        perfm_attack = {'acc': 0, 'fid': 0, 'f1score': 0}
 
-        # Set net_full for the next graph to be taken care of, which is expected to include all nodes
-        if True:
-            set_seed(seed)
-            # log_file_path = f"{file_path}/{dataset_name}/log_cega_{seed}.csv"
-            if dropout == True:
-                net_full = GCN_drop(feature_number, label_number)
-            else:
-                net_full = GcnNet(feature_number, label_number)
-            optimizer_full = th.optim.Adam(net_full.parameters(), lr=LR, weight_decay=5e-4)
+        print('========================== Model Evaluation ==========================')
+        final_train_s = time.time()
+        progress_bar = tqdm(range(EVAL_EPOCH), desc="Generating model with ALL attack nodes", ncols=100)
+        for epoch in progress_bar:
+            if epoch >= 3:
+                t0 = time.time()
+            net_full.train()
+            logits = net_full(sub_g, sub_features)
+            logp = F.log_softmax(logits, 1)
+            loss = F.nll_loss(logp, sub_labels_query)
+            optimizer_full.zero_grad()
+            loss.backward()
+            optimizer_full.step()
+            if epoch >= 3:
+                dur.append(time.time() - t0)
 
-            net_full = net_full.to(self.device)
-            net = net.to(self.device)
-
-            perfm_attack = {
-                'acc': 0,
-                'fid': 0,
-                'f1score': 0
-            }
-
-            print('========================== Model Evaluation ==========================')
-            progress_bar = tqdm(range(EVAL_EPOCH), desc="Generating model with ALL attack nodes", ncols=100)
-            for epoch in progress_bar:
-                if epoch >= 3:
-                    t0 = time.time()
-
-                net_full.train()
-                logits = net_full(sub_g, sub_features)
-                logp = F.log_softmax(logits, 1)
-                loss = F.nll_loss(logp, sub_labels_query)  # [sub_train_mask]
-
-                optimizer_full.zero_grad()
-                loss.backward()
-                optimizer_full.step()
-
-                if epoch >= 3:
-                    dur.append(time.time() - t0)
-
-                acc, f1score = evaluate(net_full, g, features, labels, test_mask)
-                fid, _ = evaluate(net_full, g, features, labels_query, test_mask)
-                if acc > perfm_attack['acc']:
-                    perfm_attack['acc'] = acc
-                if fid > perfm_attack['fid']:
-                    perfm_attack['fid'] = fid
-                if f1score > perfm_attack['f1score']:
-                    perfm_attack['f1score'] = f1score
-
-                progress_bar.set_postfix({
-                    "Loss": f"{loss.item():.4f}",
-                    "Test Acc": f"{acc:.4f}",
-                    "Test F1": f"{f1score:.4f}",
-                    # "Processed %": f"{(epoch + 1) / TGT_EPOCH * 100:.2f}",
-                    # "Time(s)": f"{np.mean(dur) if dur else 0:.4f}"
-                })
-
-            print("Test Acc {:.4f} | Test Fid {:.4f} | Test F1score {:.4f} | Time(s) {:.4f}".format(
-                perfm_attack['acc'], perfm_attack['fid'], perfm_attack['f1score'], np.mean(dur)))
-
-            epoch_metrics = pd.DataFrame({
-                'Num Attack Nodes': [sub_train_mask.sum().item()],
-                'Method': ['cega'],
-                'Test Accuracy': [perfm_attack['acc']],
-                'Test Fidelity': [perfm_attack['fid']],
-                'Test F1score': [perfm_attack['f1score']],
+            acc, f1score = evaluate(net_full, g, features, labels, test_mask)
+            fid, _ = evaluate(net_full, g, features, labels_query, test_mask)
+            perfm_attack['acc'] = max(perfm_attack['acc'], acc)
+            perfm_attack['fid'] = max(perfm_attack['fid'], fid)
+            perfm_attack['f1score'] = max(perfm_attack['f1score'], f1score)
+            progress_bar.set_postfix({
+                "Loss": f"{loss.item():.4f}",
+                "Test Acc": f"{acc:.4f}",
+                "Test F1": f"{f1score:.4f}",
             })
-            metrics_df = pd.concat([metrics_df, epoch_metrics], ignore_index=True)
-            # log_file_path = f"{file_path}/{dataset_name}/log_cega_{seed}.csv"
-            # metrics_df.to_csv(log_file_path, mode='w', header=False, index=False)
+        train_surrogate_time += (time.time() - final_train_s)
+
+        print("Test Acc {:.4f} | Test Fid {:.4f} | Test F1score {:.4f} | Time(s) {:.4f}".format(
+            perfm_attack['acc'], perfm_attack['fid'], perfm_attack['f1score'], np.mean(dur)))
+
+        epoch_metrics = pd.DataFrame({
+            'Num Attack Nodes': [sub_train_mask.sum().item()],
+            'Method': ['cega'],
+            'Test Accuracy': [perfm_attack['acc']],
+            'Test Fidelity': [perfm_attack['fid']],
+            'Test F1score': [perfm_attack['f1score']],
+        })
+        metrics_df = pd.concat([metrics_df, epoch_metrics], ignore_index=True)
+
+        # ===== assemble JSON outputs required by the new metric API =====
+        attack_total_time = time.time() - attack_time_start
+
+        perf_json = {
+            "attack": "CEGA",
+            "num_attack_nodes": int(sub_train_mask.sum().item()),
+            "acc": float(perfm_attack['acc']),
+            "fid": float(perfm_attack['fid']),
+            "f1": float(perfm_attack['f1score']),
+            "target_acc": float(target_performance['acc']),
+            "target_f1": float(target_performance['f1score']),
+        }
+        comp_json = {
+            "device": str(self.device),
+            "attack_time": float(attack_total_time),
+            "query_target_time": float(query_target_time),
+            "train_surrogate_time": float(train_surrogate_time),
+            # optional placeholders to align with AdvMEA if present there
+            "inference_surrogate_time": None,
+            "peak_memory": None,
+        }
+        return perf_json, comp_json
+

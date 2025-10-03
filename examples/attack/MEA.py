@@ -5,7 +5,6 @@ from pygip.utils.hardware import set_device
 
 # TODO verify performance
 # TODO generate shadow graph
-# TODO attack after defense
 # TODO record metrics (original acc, attack acc, fidelity)
 
 set_device("cuda:0")  # cpu, cuda:0
