@@ -6,7 +6,7 @@ from pygip.utils.hardware import set_device
 # TODO attack after defense
 # TODO record metrics (original acc, attack acc, fidelity)
 
-set_device("cuda:0")
+set_device("cpu")
 
 
 def realistic():
