@@ -24,6 +24,8 @@ class GraphPruningDefense(BaseDefense):
         super().__init__(dataset, attack_node_fraction, **kwargs)
         self.pruning_ratio = pruning_ratio
 
+
+    # A helper function to train a SimpleGCN model on a given graph.
     def _train_gcn_model(self, graph, epochs=100, lr=0.01, return_pred=False):
         graph = graph.to(self.device)
         features = graph.ndata['feat']
@@ -52,6 +54,8 @@ class GraphPruningDefense(BaseDefense):
             return test_acc, pred
         return test_acc
 
+
+    # Main method to execute the defense and calculate evaluation metrics.
     def defend(self):
         """
         Run baseline and pruned models and return ECA and Fidelity.
@@ -69,8 +73,10 @@ class GraphPruningDefense(BaseDefense):
         else:
             pruned_graph = original_graph
 
+        # Also add self-loops to the pruned graph for consistency.
         pruned_graph = dgl.add_self_loop(pruned_graph)
 
+        # Train a new GCN model from scratch on the pruned graph.
         pruned_acc, pruned_pred = self._train_gcn_model(pruned_graph, return_pred=True)
 
         test_mask = pruned_graph.ndata['test_mask']
