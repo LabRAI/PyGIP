@@ -8,14 +8,23 @@ from .atom.ATOM import ATOM
 from .Integrity import QueryBasedVerificationDefense as IntegrityVerification
 
 from .graph_pruning import GraphPruningDefense
+from .gnnfingers import GNNFingersDefense
+from .GrOVe import GroveDefense
+from .Revisiting import Revisiting
+
 
 __all__ = [
     'BackdoorWM',
+    'GraphPruningDefense',
     'ImperceptibleWM',
     'ImperceptibleWM2',
     'RandomWM',
     'SurviveWM',
     'SurviveWM2',
     'ATOM',
-    'GraphPruningDefense'
+    'GraphPruningDefense',
+    'GNNFingersDefense',
+    'IntegrityVerification',
+    'GroveDefense',
+    'Revisiting',
 ]

@@ -7,6 +7,7 @@ from .datasets import (
     Photo,
     CoauthorCS,
     CoauthorPhysics,
+    ENZYMES,
 )
 
 __all__ = [
@@ -18,4 +19,5 @@ __all__ = [
     'Photo',
     'CoauthorCS',
     'CoauthorPhysics',
+    'ENZYMES',
 ]

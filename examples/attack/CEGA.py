@@ -4,8 +4,6 @@ from pygip.models.attack import CEGA
 
 # TODO verify performance
 # TODO record metrics (original acc, attack acc, fidelity)
-# TODO attack after defense
-# TODO record metrics (original acc, attack acc, fidelity)
 
 
 def cega():

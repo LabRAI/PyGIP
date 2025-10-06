@@ -61,8 +61,7 @@ def main():
         train_local_model(surrogate_model_2, med.graph_data, med.features, surrogate_labels_2, med.train_mask, med.device)
         EBA2 = med.verify_backdoor(surrogate_model_2, med.trigger_nodes, med.target_label)
 
-        # If the extracted backdoor accuracy is above the threshold, the watermark is considered "Extracted".
-        # Otherwise, the surrogate model is considered "Independent" of the watermark.
+        # If the extracted backdoor accuracy is above the threshold, the watermark is considered "Extracted". Otherwise, the surrogate model is considered "Independent" of the watermark.
         v1_result = "Extracted" if EBA1 > verification_threshold else "Independent"
         v2_result = "Extracted" if EBA2 > verification_threshold else "Independent"
         

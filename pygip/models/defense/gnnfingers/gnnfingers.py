@@ -1,0 +1,1675 @@
+"""
+GNNFingers: A Fingerprinting Framework for Verifying Ownerships of Graph Neural Networks
+This code implements the GNNFingers framework for GNN ownership verification as described in the paper.
+The framework generates unique graph fingerprints and uses a unified verification mechanism to detect
+whether a suspect GNN was stolen from a target GNN.
+"""
+
+# ================================
+# 1. IMPORTS AND SETUP
+# ================================
+import copy
+import os
+import random
+from typing import Dict, Optional
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.optim import Adam
+from torch_geometric.loader import DataLoader
+from torch_geometric.nn import GCNConv, global_mean_pool
+from torch_geometric.utils import negative_sampling
+from torch_geometric.utils import train_test_split_edges
+
+from pygip.datasets import Dataset
+from pygip.models.defense.base import BaseDefense
+from pygip.utils.hardware import get_device
+
+# Set device for computation
+device = get_device()
+print(f'Device: {device}')
+
+
+# ================================
+# 3. UTILITY FUNCTIONS
+# ================================
+def set_seed(seed: int = 42):
+    """
+    Set random seeds for reproducibility across all libraries.
+
+    Args:
+        seed (int): Random seed value
+    """
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+# Set seed for reproducibility
+set_seed(42)
+
+
+def _pad_or_trim(vec: torch.Tensor, L: int) -> torch.Tensor:
+    """
+    Pad or trim a tensor to a specific length L.
+
+    Args:
+        vec (torch.Tensor): Input tensor
+        L (int): Target length
+
+    Returns:
+        torch.Tensor: Padded or trimmed tensor
+    """
+    vec = vec.view(-1)
+    n = vec.numel()
+    if n == L:
+        return vec
+    if n > L:  # trim
+        return vec[:L]
+    return torch.cat([vec, vec.new_zeros(L - n)], dim=0)
+
+
+def align_and_stack(tensors, dim=0) -> torch.Tensor:
+    """
+    Make all 1D tensors the same length, then stack them safely.
+
+    Args:
+        tensors (list): List of tensors to align and stack
+        dim (int): Dimension to stack along
+
+    Returns:
+        torch.Tensor: Stacked tensor
+    """
+    if len(tensors) == 0:
+        raise ValueError("align_and_stack received empty list")
+
+    # Flatten all tensors to 1D first
+    tensors = [t.view(-1) for t in tensors]
+
+    # Find maximum length
+    maxL = max(t.numel() for t in tensors)
+
+    # Pad all tensors to same length
+    aligned = []
+    for t in tensors:
+        if t.numel() < maxL:
+            # Add zeros to make same length
+            padding = torch.zeros(maxL - t.numel(), device=t.device, dtype=t.dtype)
+            t = torch.cat([t, padding], dim=0)
+        elif t.numel() > maxL:
+            # Trim if somehow longer (shouldn't happen)
+            t = t[:maxL]
+        aligned.append(t)
+
+    # Stack all tensors
+    return torch.stack(aligned, dim=dim)
+
+
+def ensure_x_for_pyg_graphs(graph_dataset):
+    """
+    Create features for graphs without node features.
+    """
+    print(f"  Checking features for {len(graph_dataset)} graphs...")
+
+    for i, g in enumerate(graph_dataset):
+        # Debug: Check what the graph has
+        if i == 0:  # Print info for first graph
+            print(f"    First graph info:")
+            print(f"      Has x: {hasattr(g, 'x')}")
+            print(f"      Has node_attr: {hasattr(g, 'node_attr')}")
+            print(f"      Has node_label: {hasattr(g, 'node_label')}")
+            print(f"      Num nodes: {g.num_nodes}")
+            print(f"      Edge index shape: {g.edge_index.shape}")
+            print(f"      y label: {g.y.item() if g.y.numel() == 1 else g.y}")
+
+        if getattr(g, "x", None) is None:
+            # Try node_attr first (ENZYMES has this)
+            if hasattr(g, 'node_attr') and g.node_attr is not None:
+                g.x = g.node_attr.float()
+                print(f"    Using node_attr, shape: {g.x.shape}")
+            else:
+                # Create one-hot degree features
+                deg = torch.bincount(g.edge_index[0], minlength=g.num_nodes)
+                max_deg = 10
+                g.x = torch.zeros(g.num_nodes, max_deg + 1)
+                deg = torch.clamp(deg, 0, max_deg)
+                g.x[torch.arange(g.num_nodes), deg] = 1.0
+                if i == 0:
+                    print(f"    Created degree features, shape: {g.x.shape}")
+
+
+def project_features_inplace(X, low: float = -1.0, high: float = 1.0):
+    """
+    Clamp node features to a valid continuous range in-place.
+
+    Args:
+        X (torch.Tensor): Node features tensor
+        low (float): Lower bound
+        high (float): Upper bound
+    """
+    with torch.no_grad():
+        X.clamp_(low, high)
+
+
+@torch.no_grad()
+def build_surrogate_gradA_from_Xgrad(X_grad: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+    """
+    Build a symmetric surrogate 'gradA' from node feature gradients.
+    Intuition: edges between high-gradient nodes get higher scores.
+    Returns a tensor in [-1, 1] with zero diagonal.
+
+    Args:
+        X_grad (torch.Tensor): Gradients of node features
+
+    Returns:
+        torch.Tensor: Surrogate adjacency gradient matrix
+    """
+    if X_grad is None:
+        return None
+
+    # Node saliency score: L2 norm per node
+    node_score = X_grad.norm(p=2, dim=1)  # [n]
+    g = torch.outer(node_score, node_score)  # [n, n]
+
+    if g.numel() == 0:
+        return g
+
+    # Normalize to [0,1], then map to [-1,1] for add/delete hint
+    g = g / (g.max() + 1e-8)
+    g = 2.0 * g - 1.0
+    g.fill_diagonal_(0.0)
+
+    return g
+
+
+# ================================
+# 4. MODEL ARCHITECTURES
+# ================================
+class GCNNodeClassifier(nn.Module):
+    """
+    Graph Convolutional Network for node classification tasks.
+    Uses 3-layer GCN architecture with dropout for regularization.
+    """
+
+    def __init__(self, in_channels, hidden, out_channels, dropout=0.5):
+        super().__init__()
+        self.conv1 = GCNConv(in_channels, hidden)
+        self.conv2 = GCNConv(hidden, hidden)
+        self.conv3 = GCNConv(hidden, out_channels)
+        self.dropout = dropout
+
+    def forward(self, x, edge_index):
+        # First GCN layer with ReLU and dropout
+        x = F.relu(self.conv1(x, edge_index))
+        x = F.dropout(x, p=self.dropout, training=self.training)
+
+        # Second GCN layer with ReLU and dropout
+        x = F.relu(self.conv2(x, edge_index))
+        x = F.dropout(x, p=self.dropout, training=self.training)
+
+        # Third GCN layer (no activation for classification)
+        x = self.conv3(x, edge_index)
+
+        return x
+
+
+class GCNGraphClassifier(nn.Module):
+    def __init__(self, in_channels, hidden, out_channels, dropout=0.5):
+        super().__init__()
+        # Adaptive architecture based on hidden size
+        self.conv1 = GCNConv(in_channels, hidden)
+        self.conv2 = GCNConv(hidden, hidden)
+        # Smaller final layer for small hidden dims
+        if hidden <= 8:
+            self.conv3 = GCNConv(hidden, hidden)
+        else:
+            self.conv3 = GCNConv(hidden, hidden)
+        self.classifier = nn.Linear(hidden, out_channels)
+        self.dropout = dropout  # Can be 0.7 for ENZYMES
+
+    def forward(self, x, edge_index, batch=None):
+        # First GCN layer
+        x = F.relu(self.conv1(x, edge_index))
+        x = F.dropout(x, p=self.dropout, training=self.training)
+
+        # Second GCN layer
+        x = F.relu(self.conv2(x, edge_index))
+
+        # Global pooling
+        if batch is None:
+            batch = torch.zeros(x.size(0), dtype=torch.long, device=x.device)
+        x = global_mean_pool(x, batch)
+
+        # Classification
+        x = self.classifier(x)
+        return x
+
+
+class GraphMatchingModel(nn.Module):
+    """
+    Graph Neural Network for graph matching tasks.
+    Computes similarity scores between pairs of graphs.
+    """
+
+    def __init__(self, in_channels, hidden, is_negative=False):
+        super().__init__()
+        self.is_negative = is_negative
+        self.conv1 = GCNConv(in_channels, hidden)
+        self.conv2 = GCNConv(hidden, hidden)
+        self.conv3 = GCNConv(hidden, hidden)
+        self.classifier = nn.Linear(hidden, 1)
+        self.dropout = 0.5
+
+    def forward(self, x1, edge_index1, x2, edge_index2):
+        # Process first graph
+        h1 = F.relu(self.conv1(x1, edge_index1))
+        h1 = F.dropout(h1, p=self.dropout, training=self.training)
+        h1 = F.relu(self.conv2(h1, edge_index1))
+        h1 = F.dropout(h1, p=self.dropout, training=self.training)
+        h1 = self.conv3(h1, edge_index1)
+        h1 = global_mean_pool(h1, torch.zeros(x1.size(0), dtype=torch.long, device=x1.device))
+
+        # Process second graph
+        h2 = F.relu(self.conv1(x2, edge_index2))
+        h2 = F.dropout(h2, p=self.dropout, training=self.training)
+        h2 = F.relu(self.conv2(h2, edge_index2))
+        h2 = F.dropout(h2, p=self.dropout, training=self.training)
+        h2 = self.conv3(h2, edge_index2)
+        h2 = global_mean_pool(h2, torch.zeros(x2.size(0), dtype=torch.long, device=x2.device))
+
+        # Compute similarity using cosine similarity
+        similarity = torch.cosine_similarity(h1, h2, dim=1)
+
+        # Ensure output is in [0, 1] range
+        similarity = (similarity + 1.0) / 2.0  # Convert from [-1,1] to [0,1]
+
+        return similarity.unsqueeze(1)
+
+
+class LinkPredictionModel(nn.Module):
+    """
+    Graph Neural Network for link prediction tasks.
+    Learns node embeddings and predicts link existence.
+    """
+
+    def __init__(self, in_channels, hidden):
+        super().__init__()
+        self.conv1 = GCNConv(in_channels, hidden)
+        self.conv2 = GCNConv(hidden, hidden)
+        self.conv3 = GCNConv(hidden, hidden)
+        self.dropout = 0.5
+
+    def forward(self, x, edge_index):
+        # First GCN layer with ReLU and dropout
+        x = F.relu(self.conv1(x, edge_index))
+        x = F.dropout(x, p=self.dropout, training=self.training)
+
+        # Second GCN layer with ReLU and dropout
+        x = F.relu(self.conv2(x, edge_index))
+        x = F.dropout(x, p=self.dropout, training=self.training)
+
+        # Third GCN layer (no activation for embeddings)
+        x = self.conv3(x, edge_index)
+
+        return x
+
+
+class Univerifier(nn.Module):
+    def __init__(self, input_dim):
+        super().__init__()
+        # Add batch normalization and stronger dropout
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, 256),
+            nn.BatchNorm1d(256),
+            nn.LeakyReLU(0.01),
+            nn.Dropout(0.5),  # Increased dropout
+
+            nn.Linear(256, 128),
+            nn.BatchNorm1d(128),
+            nn.LeakyReLU(0.01),
+            nn.Dropout(0.5),
+
+            nn.Linear(128, 64),
+            nn.BatchNorm1d(64),
+            nn.LeakyReLU(0.01),
+            nn.Dropout(0.3),
+
+            nn.Linear(64, 2)
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
+# ================================
+# 5. FINGERPRINT CLASSES
+# ================================
+class FingerprintGraph(nn.Module):
+    """
+    Represents a single fingerprint graph for GNN ownership verification.
+    Contains learnable node features and adjacency matrix.
+    """
+
+    def __init__(self, n_nodes, feat_dim, sample_m, edge_init_p=0.05):
+        super().__init__()
+        self.n = n_nodes
+        self.d = feat_dim
+        self.m = min(sample_m, n_nodes)
+
+        # Initialize learnable node features
+        X = torch.randn(self.n, self.d) * 0.1
+        self.X = nn.Parameter(X.to(device))
+
+        # Initialize learnable adjacency matrix (in logit space)
+        A0 = (torch.rand(self.n, self.n, device=device) < edge_init_p).float()
+        A0.fill_diagonal_(0.0)
+        A0 = torch.maximum(A0, A0.T)
+        self.A_logits = nn.Parameter(torch.logit(torch.clamp(A0, 1e-4, 1 - 1e-4)))
+
+        # Sample nodes for output collection
+        self.sample_idx = torch.randperm(self.n, device=device)[:self.m]
+
+        # Preselect K random pairs among the sampled nodes for link prediction
+        K = min(8, self.m * (self.m - 1) // 2)
+        pairs = []
+        if K > 0:
+            idx = self.sample_idx
+            for i in range(self.m):
+                for j in range(i + 1, self.m):
+                    pairs.append((idx[i].item(), idx[j].item()))
+                    if len(pairs) >= K:
+                        break
+                if len(pairs) >= K:
+                    break
+        self.pair_idx = pairs  # list of (u, v)
+
+        # Create a fixed "anchor" version for graph matching
+        with torch.no_grad():
+            # Independent random anchor features
+            self.anchor_X = torch.empty_like(self.X).uniform_(-1.0, 1.0)
+
+            # Independent random anchor graph
+            A0 = (torch.rand(self.n, self.n, device=self.X.device) < 0.05).float()
+            A0.fill_diagonal_(0.0)
+            A0 = torch.maximum(A0, A0.T)
+            self.register_buffer(
+                "anchor_A_logits",
+                torch.logit(torch.clamp(A0, 1e-4, 1 - 1e-4))
+            )
+
+    @torch.no_grad()
+    def edge_index(self):
+        """
+        Convert adjacency logits to edge indices.
+
+        Returns:
+            torch.Tensor: Edge indices in PyG format
+        """
+        A_prob = torch.sigmoid(self.A_logits)
+        A_bin = (A_prob > 0.5).float()
+        A_bin.fill_diagonal_(0.0)
+        A_bin = torch.maximum(A_bin, A_bin.T)
+        idx = A_bin.nonzero(as_tuple=False)
+        if idx.numel() == 0:
+            return torch.empty(2, 0, dtype=torch.long, device=self.X.device)
+        return idx.t().contiguous()
+
+    @torch.no_grad()
+    def anchor_edge_index(self):
+        """
+        Convert anchor adjacency logits to edge indices.
+
+        Returns:
+            torch.Tensor: Anchor edge indices in PyG format
+        """
+        A_prob = torch.sigmoid(self.anchor_A_logits)
+        A_bin = (A_prob > 0.5).float()
+        A_bin.fill_diagonal_(0.0)
+        A_bin = torch.maximum(A_bin, A_bin.T)
+        idx = A_bin.nonzero(as_tuple=False)
+        if idx.numel() == 0:
+            return torch.empty(2, 0, dtype=torch.long, device=self.X.device)
+        return idx.t().contiguous()
+
+    @torch.no_grad()
+    def flip_topk_by_grad(self, gradA, topk=64, step=2.5):
+        """
+        Flip top-k edges based on gradient values for discrete optimization.
+
+        Args:
+            gradA (torch.Tensor): Gradient of adjacency matrix
+            topk (int): Number of top edges to flip
+            step (float): Step size for flipping
+        """
+        g = gradA.abs()
+        triu = torch.triu(torch.ones_like(g), diagonal=1)
+        scores = (g * triu).flatten()
+        k = min(topk, scores.numel())
+        if k == 0:
+            return
+
+        _, idxs = torch.topk(scores, k=k)
+        r = self.n
+        pairs = torch.stack((idxs // r, idxs % r), dim=1)
+        A_prob = torch.sigmoid(self.A_logits).detach()
+
+        for (u, v) in pairs.tolist():
+            guv = gradA[u, v].item()
+            exist = A_prob[u, v] > 0.5
+            if exist and guv <= 0:
+                self.A_logits.data[u, v] -= step
+                self.A_logits.data[v, u] -= step
+            elif (not exist) and guv >= 0:
+                self.A_logits.data[u, v] += step
+                self.A_logits.data[v, u] += step
+        self.A_logits.data.fill_diagonal_(-10.0)
+
+
+class FingerprintSet(nn.Module):
+    """
+    Manages a set of fingerprint graphs for robust verification.
+    """
+
+    def __init__(self, P, n_nodes, feat_dim, sample_m, edge_init_p=0.05, topk_edges=64, edge_step=2.5):
+        super().__init__()
+        self.P = P
+        self.fps = nn.ModuleList([
+            FingerprintGraph(n_nodes, feat_dim, sample_m, edge_init_p)
+            for _ in range(P)
+        ]).to(device)
+        self.topk_edges = topk_edges
+        self.edge_step = edge_step
+
+    def concat_outputs(self, model, task_type='node', num_classes=None, require_grad=False):
+        """
+        Concatenate outputs from all fingerprint graphs for a given model.
+
+        Args:
+            model: GNN model to evaluate
+            task_type (str): Type of task (node, graph, matching, link)
+            num_classes (int): Number of classes
+            require_grad (bool): Whether to require gradients
+
+        Returns:
+            torch.Tensor: Concatenated outputs from all fingerprints
+        """
+        outs = []
+        model.eval()
+        ctx = torch.enable_grad() if require_grad else torch.no_grad()
+
+        with ctx:
+            for fp in self.fps:
+                ei = fp.edge_index()
+
+                if task_type == 'node' or task_type == 'node_classification':
+                    # Node classification: get predictions for sampled nodes
+                    logits = model(fp.X, ei)
+                    probs = F.softmax(logits, dim=-1)[fp.sample_idx].flatten()
+
+                elif task_type == 'graph' or task_type == 'graph_classification':
+                    # Graph classification: get prediction for entire graph
+                    batch = torch.zeros(fp.n, dtype=torch.long, device=device)
+                    logits = model(fp.X, ei, batch)
+                    probs = F.softmax(logits, dim=-1).flatten()
+                    # Ensure exactly 2 values for binary classification
+                    if probs.numel() > 2:
+                        probs = probs[:2]
+                    elif probs.numel() < 2:
+                        padding = torch.zeros(2 - probs.numel(), device=probs.device)
+                        probs = torch.cat([probs, padding])
+
+                elif task_type == 'matching' or task_type == 'graph_matching':
+                    # Graph matching: compute similarity with anchor graph
+                    ei_anchor = fp.anchor_edge_index()
+                    sim = model(fp.X, ei, fp.anchor_X, ei_anchor)  # [0,1]
+                    probs = torch.logit(torch.clamp(sim, 1e-4, 1 - 1e-4)).flatten()
+
+                elif task_type == 'link' or task_type == 'link_prediction':
+                    # Link prediction: compute scores for selected pairs
+                    z = model(fp.X, ei)
+                    scores = []
+                    # Use ALL pairs, not just K_FIXED
+                    for (u, v) in fp.pair_idx:  # Use all pairs
+                        logit = (z[u] * z[v]).sum(dim=-1, keepdim=True)
+                        scores.append(torch.sigmoid(logit))
+                    # Don't limit to K_FIXED
+                    probs = torch.cat(scores, dim=0).flatten()
+                else:
+                    # Default case: node classification
+                    logits = model(fp.X, ei)
+                    probs = F.softmax(logits, dim=-1)[fp.sample_idx].flatten()
+
+                outs.append(probs)
+
+        # Concatenate all outputs
+        result = torch.cat(outs, dim=0)
+        return result
+
+    def flip_adj_by_grad(self, surrogate_grad_list):
+        """
+        Flip adjacency matrices based on surrogate gradients.
+
+        Args:
+            surrogate_grad_list (list): List of surrogate gradients
+        """
+        for fp, g in zip(self.fps, surrogate_grad_list):
+            fp.flip_topk_by_grad(g, topk=self.topk_edges, step=self.edge_step)
+
+
+# ================================
+# 6. MAIN DEFENSE CLASS
+# ================================
+class GNNFingersDefense(BaseDefense):
+    """
+    Main GNNFingers defense class for GNN ownership verification.
+    Implements the complete pipeline from paper methodology.
+    """
+
+    supported_api_types = {'pyg', 'dgl'}
+    supported_datasets = {'Cora', 'Citeseer', 'ENZYMES', 'PROTEINS', 'AIDS', 'LINUX'}
+
+    def __init__(self, dataset: Dataset, attack_node_fraction: float,
+                 config: Optional[Dict] = None, **kwargs):
+        """
+        Initialize the GNNFingers defense.
+
+        Args:
+            dataset: Dataset to use for training and verification
+            attack_node_fraction: Fraction of nodes to attack
+            config: Configuration dictionary
+        """
+        super().__init__(dataset, attack_node_fraction)
+
+        # Configuration
+        self.config = config or self._get_default_config()
+        self.task_type = self._infer_task_type()
+
+        # Initialize components
+        self.target_model = None
+        self.fp_set = None
+        self.univerifier = None
+        self.opt_V = None
+
+        # For storing results
+        self.results = {}
+
+    def _get_default_config(self):
+        """
+        Get default configuration parameters.
+
+        Returns:
+            dict: Default configuration
+        """
+        return {
+            'POS_TRAIN': 30, 'POS_TEST': 30,
+            'NEG_TRAIN': 30, 'NEG_TEST': 30,
+            'FP_P': 64, 'FP_NODES': 32, 'FP_SAMPLE_M': 32,
+            'FP_EDGE_INIT_P': 0.05, 'FP_EDGE_TOPK': 32,
+            'EDGE_LOGIT_STEP': 2.5,
+            'OUTER_ITERS': 20, 'FP_STEPS': 5, 'V_STEPS': 10,
+            'LR_TARGET': 0.005, 'WD_TARGET': 5e-4,
+            'LR_V': 1e-3, 'LR_X': 1e-3,
+            'TARGET_EPOCHS': 20, 'SEED': 42,
+            # Obfuscation technique flags (Section 3.2)
+            'USE_FT_LAST': True, 'USE_FT_ALL': True,
+            'USE_PR_LAST': True, 'USE_PR_ALL': True,
+            'USE_DISTILL': True,
+            'DISTILL_STEPS': 250  # paper uses ~1000, adjust based on compute
+        }
+
+    def _infer_task_type(self):
+        """
+        Infer task type from dataset name.
+
+        Returns:
+            str: Task type (node_classification, graph_classification, etc.)
+        """
+        if self.dataset.dataset_name in ['Cora', 'Citeseer']:
+            if self.task_type == 'link_prediction':
+                return 'link_prediction'
+            else:
+                return 'node_classification'
+        elif self.dataset.dataset_name in ['ENZYMES', 'PROTEINS']:
+            return 'graph_classification'
+        elif self.dataset.dataset_name in ['AIDS', 'LINUX']:
+            return 'graph_matching'
+        else:
+            return 'node_classification'
+
+    def defend(self):
+        """
+        Main defense entry point. Executes the complete GNNFingers pipeline.
+
+        Returns:
+            dict: Verification results
+        """
+
+        print(f"\n{'=' * 60}")
+        print(f"GNNFingers Defense: {self.task_type} on {self.dataset.dataset_name}")
+        print(f"{'=' * 60}")
+
+        # Step 1: Train target model
+        print("\n[1/5] Training target model...")
+        self._train_target_model()
+
+        # Step 2: Generate suspect models
+        print("\n[2/5] Generating suspect models...")
+        self._generate_suspect_models()
+
+        # Step 3: Initialize fingerprints
+        print("\n[3/5] Initializing fingerprints...")
+        self._initialize_fingerprints()
+
+        # Step 4: Joint learning
+        print("\n[4/5] Joint learning...")
+        self._joint_learning()
+
+        # Step 5: Evaluate
+        print("\n[5/5] Evaluating...")
+        results = self._evaluate()
+
+        return results
+
+    def _load_model(self):
+        """
+        Load pre-trained model if available.
+        """
+        if hasattr(self, 'model_path') and self.model_path and os.path.exists(self.model_path):
+            self.target_model = torch.load(self.model_path, map_location=self.device)
+            print(f"Loaded model from {self.model_path}")
+        else:
+            print("No pre-trained model found, will train from scratch")
+            return None
+
+    def _train_target_model(self):
+        """
+        Train the target model based on task type.
+        """
+        if self.task_type == 'node_classification':
+            num_features = self.num_features
+            num_classes = self.num_classes
+            # Standard architecture for node classification
+            self.target_model = GCNNodeClassifier(num_features, 16, num_classes, dropout=0.5).to(self.device)
+            self._train_node_model(self.target_model, use_label_smoothing=True)
+        elif self.task_type == 'graph_classification':
+            num_features = self.num_features
+            num_classes = self.num_classes
+            # SMALLER model for ENZYMES to prevent overfitting
+            if self.dataset.dataset_name == 'ENZYMES':
+                hidden_dim = 8  # Reduced from 16
+                dropout = 0.7  # Increased from 0.5
+            else:
+                hidden_dim = 16
+                dropout = 0.5
+            self.target_model = GCNGraphClassifier(num_features, hidden_dim, num_classes, dropout=dropout).to(
+                self.device)
+            self._train_graph_model(self.target_model)
+        elif self.task_type == 'graph_matching':
+            hidden_dim = 32 if self.dataset.dataset_name == 'AIDS' else 16
+            self.target_model = GraphMatchingModel(self.num_features, hidden_dim).to(self.device)
+            self._train_matching_model(self.target_model)
+        elif self.task_type == 'link_prediction':
+            num_features = self.num_features
+            # Standard architecture
+            self.target_model = LinkPredictionModel(num_features, 16).to(self.device)
+            # Pass flag to use more negative samples
+            self._train_link_model(self.target_model, use_more_negatives=True)
+
+    def _train_node_model(self, model, epochs=None, use_label_smoothing=False):
+        """
+        Train model for node classification task.
+
+        Args:
+            model: Model to train
+            epochs (int): Number of training epochs
+        """
+        epochs = epochs or self.config['TARGET_EPOCHS']
+        opt = Adam(model.parameters(), lr=self.config['LR_TARGET'], weight_decay=self.config['WD_TARGET'])
+        best_val = 0
+        best_state = None
+
+        # Create train/val/test masks if not exist
+        if not hasattr(self.graph_data, 'train_mask'):
+            n = self.graph_data.num_nodes
+            idx = torch.randperm(n)
+            n_tr = int(n * 0.7)
+            n_va = int(n * 0.1)
+            self.graph_data.train_mask = torch.zeros(n, dtype=torch.bool)
+            self.graph_data.train_mask[idx[:n_tr]] = True
+            self.graph_data.val_mask = torch.zeros(n, dtype=torch.bool)
+            self.graph_data.val_mask[idx[n_tr:n_tr + n_va]] = True
+            self.graph_data.test_mask = torch.zeros(n, dtype=torch.bool)
+            self.graph_data.test_mask[idx[n_tr + n_va:]] = True
+
+        if use_label_smoothing:
+            criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
+        else:
+            criterion = nn.CrossEntropyLoss()
+
+        for ep in range(epochs):
+            model.train()
+            opt.zero_grad()
+            out = model(self.graph_data.x, self.graph_data.edge_index)
+            # Use criterion with label smoothing
+            loss = criterion(out[self.graph_data.train_mask],
+                             self.graph_data.y[self.graph_data.train_mask])
+            loss.backward()
+            opt.step()
+
+            if ep % 20 == 0:
+                model.eval()
+                with torch.no_grad():
+                    pred = model(self.graph_data.x, self.graph_data.edge_index).argmax(dim=1)
+                    val_acc = (pred[self.graph_data.val_mask] == self.graph_data.y[
+                        self.graph_data.val_mask]).float().mean()
+                    if val_acc > best_val:
+                        best_val = val_acc
+                        best_state = copy.deepcopy(model.state_dict())
+
+        if best_state:
+            model.load_state_dict(best_state)
+        print(f"  Target model trained. Val accuracy: {best_val:.3f}")
+
+    def _train_graph_model(self, model, epochs=None):
+        """
+        Train model for graph classification task.
+
+        Args:
+            model: Model to train
+            epochs (int): Number of training epochs
+        """
+        epochs = epochs or self.config['TARGET_EPOCHS']
+        ensure_x_for_pyg_graphs(self.graph_dataset)
+
+        from sklearn.model_selection import train_test_split
+        # Get all labels
+        all_labels = [g.y.item() for g in self.graph_dataset]
+        indices = list(range(len(self.graph_dataset)))
+
+        # Stratified split
+        train_idx, temp_idx, train_y, temp_y = train_test_split(
+            indices, all_labels, test_size=0.3, stratify=all_labels, random_state=42
+        )
+        val_idx, test_idx, val_y, test_y = train_test_split(
+            temp_idx, temp_y, test_size=0.67, stratify=temp_y, random_state=42  # 0.67 of 0.3 = ~0.2 for test
+        )
+
+        # Create datasets
+        train_dataset = [self.graph_dataset[i] for i in train_idx]
+        val_dataset = [self.graph_dataset[i] for i in val_idx]
+
+        print(f"  Train size: {len(train_dataset)}, Val size: {len(val_dataset)}")
+        print(f"  Train labels: {set(train_y)}")
+        print(f"  Val labels: {set(val_y)}")
+
+        # NEW: Dataset-specific settings
+        if self.dataset.dataset_name == 'PROTEINS':
+            # PROTEINS is larger and more complex, needs different settings
+            batch_size = 64  # Larger batch size (was 32)
+            learning_rate = 0.001  # Lower learning rate (was 0.01)
+            print("  Using PROTEINS-specific settings: batch=64, lr=0.001")
+        else:
+            # Default settings (works well for ENZYMES)
+            batch_size = 32
+            learning_rate = 0.01
+
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+        val_loader = DataLoader(val_dataset, batch_size=batch_size)
+
+        opt = Adam(model.parameters(), lr=learning_rate, weight_decay=1e-4)
+        best_val = 0
+
+        for ep in range(epochs):
+            # Training
+            model.train()
+            train_loss = 0
+            train_correct = 0
+            train_total = 0
+
+            for batch in train_loader:
+                batch = batch.to(self.device)
+                opt.zero_grad()
+                out = model(batch.x, batch.edge_index, batch.batch)
+                loss = F.cross_entropy(out, batch.y)
+                loss.backward()
+                opt.step()
+
+                train_loss += loss.item()
+                pred = out.argmax(dim=1)
+                train_correct += (pred == batch.y).sum().item()
+                train_total += batch.y.size(0)
+
+            # Validate every 2 epochs
+            if ep % 2 == 0:
+                model.eval()
+                val_correct = 0
+                val_total = 0
+
+                with torch.no_grad():
+                    for batch in val_loader:
+                        batch = batch.to(self.device)
+                        out = model(batch.x, batch.edge_index, batch.batch)
+                        pred = out.argmax(dim=1)
+                        val_correct += (pred == batch.y).sum().item()
+                        val_total += batch.y.size(0)
+
+                train_acc = train_correct / max(train_total, 1)
+                val_acc = val_correct / max(val_total, 1)
+                avg_loss = train_loss / len(train_loader)
+
+                print(f"    Epoch {ep}: Loss={avg_loss:.4f}, Train={train_acc:.3f}, Val={val_acc:.3f}")
+                best_val = max(best_val, val_acc)
+
+        print(f"  Target model trained. Val accuracy: {best_val:.3f}")
+
+    def _train_matching_model(self, model, epochs=None):
+        """
+        Train model for graph matching task.
+
+        Args:
+            model: Model to train
+            epochs (int): Number of training epochs
+        """
+        # Use reduced settings for AIDS/LINUX datasets
+        if hasattr(self.dataset, 'name') and self.dataset.dataset_name in ['AIDS', 'LINUX']:
+            epochs = 10
+            max_pairs = 100
+            subset_size = min(200, len(self.graph_dataset))  # Increase from 50
+        else:
+            epochs = epochs or self.config['TARGET_EPOCHS']
+            max_pairs = 200
+            subset_size = len(self.graph_dataset)
+
+        ensure_x_for_pyg_graphs(self.graph_dataset)
+        opt = Adam(model.parameters(), lr=self.config['LR_TARGET'], weight_decay=self.config['WD_TARGET'])
+
+        # Use subset for speed
+        subset_size = min(subset_size, len(self.graph_dataset))
+        train_dataset = self.graph_dataset[:subset_size]
+        print(f"  Training on {subset_size} graphs (subset for speed)")
+
+        for ep in range(epochs):
+            model.train()
+            total_loss = 0
+            count = 0
+
+            # Create positive and negative pairs
+            for _ in range(max_pairs):
+                i = torch.randint(0, len(train_dataset), (1,)).item()
+                j = torch.randint(0, len(train_dataset), (1,)).item()
+                if i == j:
+                    continue
+
+                g1 = train_dataset[i].to(self.device)
+                g2 = train_dataset[j].to(self.device)
+                label = 1.0 if g1.y == g2.y else 0.0
+
+                opt.zero_grad()
+                similarity = model(g1.x, g1.edge_index, g2.x, g2.edge_index)
+                loss = F.mse_loss(similarity, torch.tensor([[label]], device=self.device))
+                loss.backward()
+                opt.step()
+                total_loss += loss.item()
+                count += 1
+
+            if ep % 2 == 0:
+                print(f"  Epoch {ep}: Loss = {total_loss / max(count, 1):.4f}")
+
+        print(f"  Target model trained (quick mode)")
+
+    def _train_matching_model_neg(self, model, epochs=3, max_pairs=50, subset_size=100):
+        """
+        Train negative model with anti-objective for graph matching.
+        Same-class -> 0, diff-class -> 1.
+
+        Args:
+            model: Model to train
+            epochs (int): Number of training epochs
+            max_pairs (int): Maximum number of pairs
+            subset_size (int): Subset size for training
+        """
+        ensure_x_for_pyg_graphs(self.graph_dataset)
+        opt = Adam(model.parameters(), lr=self.config['LR_TARGET'],
+                   weight_decay=self.config['WD_TARGET'])
+
+        subset_size = min(subset_size, len(self.graph_dataset))
+        train_dataset = self.graph_dataset[:subset_size]
+
+        for ep in range(epochs):
+            model.train()
+            total_loss, cnt = 0.0, 0
+
+            for _ in range(max_pairs):
+                i = torch.randint(0, subset_size, (1,)).item()
+                j = torch.randint(0, subset_size, (1,)).item()
+                if i == j:
+                    continue
+
+                g1 = train_dataset[i].to(self.device)
+                g2 = train_dataset[j].to(self.device)
+
+                # Invert labels: same-class -> 0, diff-class -> 1
+                label = 0.0 if g1.y == g2.y else 1.0
+
+                opt.zero_grad()
+                sim = model(g1.x, g1.edge_index, g2.x, g2.edge_index)  # in [0,1]
+                loss = F.mse_loss(sim, torch.tensor([[label]], device=self.device))
+                loss.backward()
+                opt.step()
+                total_loss += loss.item()
+                cnt += 1
+
+    def _train_link_model(self, model, epochs=None, use_more_negatives=False):
+        """
+        Train model for link prediction task.
+
+        Args:
+            model: Model to train
+            epochs (int): Number of training epochs
+            use_more_negatives (bool): Whether to use more negative samples
+        """
+        epochs = epochs or self.config['TARGET_EPOCHS']
+        opt = Adam(model.parameters(), lr=self.config['LR_TARGET'], weight_decay=self.config['WD_TARGET'])
+
+        # One-time split (only POS edges are cached)
+        if not hasattr(self, "_lp_split_done"):
+            data_lp = self.graph_data.clone()
+            split = train_test_split_edges(data_lp)
+            self._train_pos_edge_index = split.train_pos_edge_index.to(self.device)
+            self._val_pos_edge_index = split.val_pos_edge_index.to(self.device)
+            self._test_pos_edge_index = split.test_pos_edge_index.to(self.device)
+            # Message passing only on train pos edges
+            self._mp_edge_index = self._train_pos_edge_index
+            self._lp_split_done = True
+
+        best_val = 0.0
+
+        for ep in range(epochs):
+            model.train()
+            opt.zero_grad()
+
+            # Embeddings from training graph - MOVED BEFORE use_more_negatives check
+            z = model(self.graph_data.x, self._mp_edge_index)  # Define z here
+
+            # Determine number of negative samples
+            num_pos = self._train_pos_edge_index.size(1)
+            if use_more_negatives:
+                num_neg_tr = num_pos * 2  # 2x more negatives
+            else:
+                num_neg_tr = num_pos
+
+            # Sample negative edges
+            neg_e = negative_sampling(
+                edge_index=self._mp_edge_index,
+                num_nodes=self.graph_data.num_nodes,
+                num_neg_samples=num_neg_tr
+            ).to(self.device)
+
+            pos_e = self._train_pos_edge_index
+            pos_scores = (z[pos_e[0]] * z[pos_e[1]]).sum(dim=1)
+            neg_scores = (z[neg_e[0]] * z[neg_e[1]]).sum(dim=1)
+
+            pos_loss = F.binary_cross_entropy_with_logits(pos_scores, torch.ones_like(pos_scores))
+            neg_loss = F.binary_cross_entropy_with_logits(neg_scores, torch.zeros_like(neg_scores))
+            loss = pos_loss + neg_loss
+
+            loss.backward()
+            opt.step()
+
+            # Validation
+            if ep % 20 == 0:
+                model.eval()
+                with torch.no_grad():
+                    z = model(self.graph_data.x, self._mp_edge_index)
+                    vp = (z[self._val_pos_edge_index[0]] * z[self._val_pos_edge_index[1]]).sum(dim=1)
+
+                    # Sample same #neg as val pos
+                    num_neg_val = self._val_pos_edge_index.size(1)
+                    vn_e = negative_sampling(
+                        edge_index=self._mp_edge_index,
+                        num_nodes=self.graph_data.num_nodes,
+                        num_neg_samples=num_neg_val
+                    ).to(self.device)
+                    vn = (z[vn_e[0]] * z[vn_e[1]]).sum(dim=1)
+
+                    y = torch.cat([torch.ones_like(vp), torch.zeros_like(vn)])
+                    s = torch.cat([vp, vn]).sigmoid()
+                    val_acc = ((s > 0.5) == (y > 0.5)).float().mean().item()
+                    best_val = max(best_val, val_acc)
+                    print(f"  [LP] Epoch {ep:03d}: loss={loss.item():.4f}  val_acc={val_acc:.3f}")
+
+        print(f"  Target (LP) model trained. Best val_acc: {best_val:.3f}")
+
+    def _fine_tune_model(self, model, layers='last', epochs=10):
+        """
+        Fine-tune specific layers of the model.
+
+        Args:
+            model: Model to fine-tune
+            layers: 'last' or 'all' layers to fine-tune
+            epochs: Number of fine-tuning epochs
+        """
+        model = copy.deepcopy(model)
+
+        # Freeze layers based on configuration
+        if layers == 'last':
+            # Freeze all layers except the last
+            for name, param in model.named_parameters():
+                if 'conv3' not in name and 'classifier' not in name:
+                    param.requires_grad = False
+        # If layers == 'all', all parameters remain trainable
+
+        # Fine-tune based on task type
+        if self.task_type == 'node_classification':
+            self._train_node_model(model, epochs=epochs)
+        elif self.task_type == 'graph_classification':
+            self._train_graph_model(model, epochs=epochs)
+        elif self.task_type == 'link_prediction':
+            self._train_link_model(model, epochs=epochs)
+        elif self.task_type == 'graph_matching':
+            pass  # No additional fine-tuning for matching
+
+        # Unfreeze all parameters
+        for param in model.parameters():
+            param.requires_grad = True
+
+        return model
+
+    def _partial_retrain_model(self, model, layers='last', epochs=10):
+        """
+        Partially retrain model by reinitializing specific layers.
+
+        Args:
+            model: Model to retrain
+            layers: 'last' or 'all' layers to reinitialize
+            epochs: Number of retraining epochs
+        """
+        model = copy.deepcopy(model)
+
+        # Reinitialize weights based on configuration
+        if layers == 'last':
+            # Reinitialize only the last layer
+            if hasattr(model, 'conv3'):
+                # GCNConv stores weight in lin.weight
+                if hasattr(model, 'classifier'):
+                    nn.init.xavier_uniform_(model.conv3.lin.weight)
+                    if model.conv3.bias is not None:
+                        nn.init.zeros_(model.conv3.bias)
+            if hasattr(model, 'classifier'):
+                nn.init.xavier_uniform_(model.classifier.weight)
+                if hasattr(model.classifier, 'bias'):
+                    nn.init.zeros_(model.classifier.bias)
+        else:  # layers == 'all'
+            # Reinitialize all layers
+            for name, module in model.named_modules():
+                if isinstance(module, GCNConv):
+                    # GCNConv has lin (Linear layer) inside it
+                    if hasattr(module, 'lin'):
+                        nn.init.xavier_uniform_(module.lin.weight)
+                    if module.bias is not None:
+                        nn.init.zeros_(module.bias)
+                elif isinstance(module, nn.Linear):
+                    nn.init.xavier_uniform_(module.weight)
+                    if hasattr(module, 'bias') and module.bias is not None:
+                        nn.init.zeros_(module.bias)
+
+        # Retrain the model
+        if self.task_type == 'node_classification':
+            self._train_node_model(model, epochs=epochs)
+        elif self.task_type == 'graph_classification':
+            self._train_graph_model(model, epochs=epochs)
+        elif self.task_type == 'link_prediction':
+            self._train_link_model(model, epochs=epochs)
+        elif self.task_type == 'graph_matching':
+            self._train_matching_model(model, epochs=epochs // 2)
+
+        return model
+
+    def _distill_model(self, teacher_model, steps=500):
+        """
+        Perform knowledge distillation from teacher to student model.
+
+        Args:
+            teacher_model: Teacher model to distill from
+            steps: Number of distillation steps
+        """
+        # Create student model with different architecture
+        if self.task_type == 'node_classification':
+            student = GCNNodeClassifier(self.num_features, 32, self.num_classes).to(self.device)
+        elif self.task_type == 'graph_classification':
+            student = GCNGraphClassifier(self.num_features, 32, self.num_classes).to(self.device)
+        elif self.task_type == 'link_prediction':
+            teacher_hidden = 16  # Default
+            if hasattr(teacher_model, 'conv1'):
+                # Get actual hidden dim from teacher
+                for name, module in teacher_model.named_modules():
+                    if isinstance(module, GCNConv):
+                        teacher_hidden = module.out_channels
+                        break
+
+            # Student MUST use same hidden dim for link prediction
+            student = LinkPredictionModel(self.num_features, teacher_hidden).to(self.device)
+
+        elif self.task_type == 'graph_matching':
+            student = GraphMatchingModel(self.num_features, 32).to(self.device)
+
+            teacher_model.eval()
+            opt = Adam(student.parameters(), lr=0.001)
+            temperature = 3.0
+
+            for step in range(steps):
+                student.train()
+                opt.zero_grad()
+
+            if self.task_type == 'node_classification' and self.graph_data is not None:
+                # Get teacher outputs
+                with torch.no_grad():
+                    teacher_out = teacher_model(self.graph_data.x, self.graph_data.edge_index)
+                    teacher_soft = F.softmax(teacher_out / temperature, dim=1)
+
+                # Get student outputs
+                student_out = student(self.graph_data.x, self.graph_data.edge_index)
+                student_log_soft = F.log_softmax(student_out / temperature, dim=1)
+
+                # KL divergence loss
+                loss = F.kl_div(student_log_soft, teacher_soft, reduction='batchmean') * (temperature ** 2)
+
+            elif self.task_type == 'graph_classification' and self.graph_dataset is not None:
+                # Sample batch
+                batch_size = min(32, len(self.graph_dataset))
+                indices = torch.randperm(len(self.graph_dataset))[:batch_size]
+                loss = 0
+
+                for idx in indices:
+                    g = self.graph_dataset[idx].to(self.device)
+                    with torch.no_grad():
+                        teacher_out = teacher_model(g.x, g.edge_index, g.batch if hasattr(g, 'batch') else None)
+                        teacher_soft = F.softmax(teacher_out / temperature, dim=1)
+
+                    student_out = student(g.x, g.edge_index, g.batch if hasattr(g, 'batch') else None)
+                    student_log_soft = F.log_softmax(student_out / temperature, dim=1)
+                    loss += F.kl_div(student_log_soft, teacher_soft, reduction='batchmean')
+
+                loss = loss / batch_size * (temperature ** 2)
+
+            elif self.task_type == 'link_prediction':
+                with torch.no_grad():
+                    teacher_emb = teacher_model(self.graph_data.x, self.graph_data.edge_index)
+                student_emb = student(self.graph_data.x, self.graph_data.edge_index)
+                # Both should have same shape now
+                assert teacher_emb.shape == student_emb.shape, f"Shape mismatch: {teacher_emb.shape} vs {student_emb.shape}"
+                loss = F.mse_loss(student_emb, teacher_emb)
+
+            elif self.task_type == 'graph_matching':
+                # NEW: Add graph matching distillation
+                ensure_x_for_pyg_graphs(self.graph_dataset)
+
+                # Sample pairs of graphs
+                batch_size = min(10, len(self.graph_dataset))
+                loss = 0
+
+                for _ in range(batch_size):
+                    i = torch.randint(0, len(self.graph_dataset), (1,)).item()
+                    j = torch.randint(0, len(self.graph_dataset), (1,)).item()
+
+                    g1 = self.graph_dataset[i].to(self.device)
+                    g2 = self.graph_dataset[j].to(self.device)
+
+                    with torch.no_grad():
+                        teacher_sim = teacher_model(g1.x, g1.edge_index, g2.x, g2.edge_index)
+
+                    student_sim = student(g1.x, g1.edge_index, g2.x, g2.edge_index)
+                    loss += F.mse_loss(student_sim, teacher_sim)
+
+                loss = loss / batch_size
+                # Now 'loss' is defined for graph_matching!
+
+            else:
+                # Fallback
+                return copy.deepcopy(teacher_model)
+
+            loss.backward()
+            opt.step()
+
+        return student
+
+    def _generate_suspect_models(self):
+        # Get total models needed
+        pos_total = self.config['POS_TRAIN'] + self.config['POS_TEST']  # e.g., 50
+        neg_total = self.config['NEG_TRAIN'] + self.config['NEG_TEST']
+        train_epochs = 10
+
+        # Define all techniques we want to use
+        techniques = ['FT_LAST', 'FT_ALL', 'PR_LAST', 'PR_ALL', 'DISTILL']
+
+        # Calculate how many models per technique
+        # If pos_total=50 and 5 techniques: 50//5 = 10 per technique
+        models_per_technique = pos_total // len(techniques)
+
+        # Handle remainder (if pos_total=52, remainder=2)
+        remainder = pos_total % len(techniques)
+
+        self.pos_models = []
+
+        # Loop through each technique
+        for i, technique in enumerate(techniques):
+            # First techniques get extra model if there's remainder
+            # If remainder=2: first 2 techniques get 11 models, rest get 10
+            count = models_per_technique + (1 if i < remainder else 0)
+
+            print(f"  Creating {count} models for {technique}")
+
+            # Create 'count' models for this technique
+            for j in range(count):
+                set_seed(100 + len(self.pos_models))
+
+                # Create model based on technique type
+                if technique == 'FT_LAST':
+                    model = self._fine_tune_model(self.target_model, layers='last', epochs=train_epochs)
+                elif technique == 'FT_ALL':
+                    model = self._fine_tune_model(self.target_model, layers='all', epochs=train_epochs)
+                elif technique == 'PR_LAST':
+                    model = self._partial_retrain_model(self.target_model, layers='last', epochs=train_epochs)
+                elif technique == 'PR_ALL':
+                    model = self._partial_retrain_model(self.target_model, layers='all', epochs=train_epochs)
+                elif technique == 'DISTILL':
+                    model = self._distill_model(self.target_model, steps=self.config['DISTILL_STEPS'])
+
+                self.pos_models.append(model.eval())
+                print(f"    Created {technique} model {len(self.pos_models)}")
+
+        # Generate negative models
+        self.neg_models = []
+        for i in range(neg_total):
+            set_seed(500 + i)
+            # Mix of strategies for negatives
+            strategy = i % 4
+
+            if strategy == 0:
+                # Completely different architecture
+                hidden = 64 if i % 2 == 0 else 8
+            elif strategy == 1:
+                # Same architecture, random init
+                hidden = 16
+            elif strategy == 2:
+                # Different activation functions
+                hidden = 32
+            else:
+                # Different depth (2 or 4 layers instead of 3)
+                hidden = 16
+            if self.task_type == 'graph_matching':
+                model = GraphMatchingModel(self.num_features, hidden).to(self.device)
+                # Use different training strategy for some negatives
+                if i % 3 == 0:
+                    self._train_matching_model_neg(model, epochs=5)
+                else:
+                    self._train_matching_model(model, epochs=10)
+            elif self.task_type == 'node_classification':
+                model = GCNNodeClassifier(self.num_features, hidden, self.num_classes).to(self.device)
+                self._train_node_model(model, epochs=50)
+            elif self.task_type == 'graph_classification':
+                model = GCNGraphClassifier(self.num_features, 32, self.num_classes).to(self.device)
+                self._train_graph_model(model, epochs=50)
+            elif self.task_type == 'link_prediction':
+                model = LinkPredictionModel(self.num_features, 32).to(self.device)
+                self._train_link_model(model, epochs=50)
+            self.neg_models.append(model.eval())
+
+        # Split into train and test sets
+        if hasattr(self.dataset, 'name') and self.dataset.dataset_name in ['AIDS', 'LINUX']:
+            n_pos_tr = n_neg_tr = 5
+        else:
+            n_pos_tr = self.config['POS_TRAIN']
+            n_neg_tr = self.config['NEG_TRAIN']
+
+        self.pos_train = self.pos_models[:n_pos_tr]
+        self.pos_test = self.pos_models[n_pos_tr:]
+        self.neg_train = self.neg_models[:n_neg_tr]
+        self.neg_test = self.neg_models[n_neg_tr:]
+
+        print(f"  Generated {len(self.pos_models)} positive and {len(self.neg_models)} negative models")
+
+    def _initialize_fingerprints(self):
+        """
+        Initialize fingerprint graphs for verification.
+        """
+        # Ensure num_features is correct for TU datasets after ensure_x
+        if (getattr(self, "num_features", None) in (None, 0)) and (self.graph_dataset is not None):
+            if getattr(self.graph_dataset[0], "x", None) is not None:
+                self.num_features = int(self.graph_dataset[0].x.size(1))
+
+        # Determine input dimensions based on task type
+        if self.task_type == 'node_classification':
+            num_features = self.num_features
+            num_classes = self.num_classes
+        elif self.task_type == 'graph_classification':
+            num_features = self.num_features
+            num_classes = self.num_classes
+        elif self.task_type == 'graph_matching':
+            num_features = self.num_features
+            num_classes = 2
+        elif self.task_type == 'link_prediction':
+            num_features = self.num_features
+            num_classes = 2
+
+        self.fp_set = FingerprintSet(
+            P=self.config['FP_P'],
+            n_nodes=self.config['FP_NODES'],
+            feat_dim=num_features,
+            sample_m=self.config['FP_SAMPLE_M'],
+            edge_init_p=self.config['FP_EDGE_INIT_P'],
+            topk_edges=self.config['FP_EDGE_TOPK'],
+            edge_step=self.config['EDGE_LOGIT_STEP']
+        )
+
+        # Determine univerifier input dimension
+        if self.task_type == 'node_classification':
+            input_dim = self.config['FP_P'] * self.config['FP_SAMPLE_M'] * num_classes
+        elif self.task_type == 'graph_classification':
+            input_dim = self.config['FP_P'] * 2
+        elif self.task_type == 'graph_matching':
+            input_dim = self.config['FP_P'] * 1
+        elif self.task_type == 'link_prediction':
+            sample_m = self.config['FP_SAMPLE_M']
+            K = min(8, sample_m * (sample_m - 1) // 2)  # Use sample_m instead of self.m
+            input_dim = self.config['FP_P'] * K
+            print(f"  Link prediction: K={K}, input_dim={input_dim}")
+
+        # NEW: Add dataset-specific weight decay for regularization
+        # if self.dataset.dataset_name == 'PROTEINS':
+        #  weight_decay = 0.01  # Strong regularization for PROTEINS
+        #  print("  Using weight_decay=0.01 for PROTEINS")
+        # elif self.dataset.dataset_name == 'AIDS':
+        #  weight_decay = 0.005  # Medium regularization for AIDS
+        #   print("  Using weight_decay=0.005 for AIDS")
+        #  elif self.dataset.dataset_name == 'Citeseer' and self.task_type == 'link_prediction':
+        #  weight_decay = 0.01  # Strong for Citeseer link prediction
+        #   print("  Using weight_decay=0.01 for Citeseer link prediction")
+        # else:
+        #  weight_decay = 0.001  # Light regularization for others
+
+        # Initialize univerifier
+        self.univerifier = Univerifier(input_dim).to(self.device)
+        self.opt_V = Adam(self.univerifier.parameters(), lr=self.config['LR_V'])
+
+        print(f"  Initialized {self.config['FP_P']} fingerprints")
+
+    def _joint_learning(self):
+        """
+        Jointly optimize fingerprints and univerifier.
+        """
+        models_pos_tr = [self.target_model] + self.pos_train
+        models_neg_tr = self.neg_train
+        # Split training models into train/val for better generalization
+        n_val = max(2, len(self.pos_train) // 5)  # Use 20% for validation
+
+        pos_train_split = models_pos_tr[:-n_val]  # Training subset
+        pos_val_split = models_pos_tr[-n_val:]  # Validation subset
+        neg_train_split = models_neg_tr[:-n_val]  # Training subset
+        neg_val_split = models_neg_tr[-n_val:]  # Validation subset
+
+        # Set iteration number based on task type
+        if self.task_type == 'graph_matching':
+            iterations = 50  # More iterations for matching
+        else:
+            iterations = self.config['OUTER_ITERS']
+
+        # Initialize these variables BEFORE the loop
+        best_val_acc = 0  # <-- IMPORTANT: Initialize here
+        patience_counter = 0
+        self.best_fp_state = None  # Initialize to None
+        self.best_univ_state = None  # Initialize to None
+        scheduler_V = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            self.opt_V, mode='max', factor=0.5, patience=5
+        )
+        # Main optimization loop
+        for it in range(1, iterations + 1):
+            # Update with different learning rates for different stages
+            if it < 20:
+                lr_scale = 1.0
+            elif it < 40:
+                lr_scale = 0.5
+            else:
+                lr_scale = 0.1
+            self._update_fingerprints(pos_train_split, neg_train_split, lr_scale)
+            self._update_univerifier(pos_train_split, neg_train_split)
+
+            if it % 5 == 0:
+                train_acc = self._check_training_acc(pos_train_split, neg_train_split)
+                val_acc = self._check_training_acc(pos_val_split, neg_val_split)
+                scheduler_V.step(val_acc)
+                print(f"  Iter {it}: Train={train_acc:.3f}, Val={val_acc:.3f}")
+
+                # Save best model based on validation accuracy
+                if val_acc > best_val_acc:
+                    best_val_acc = val_acc
+                    # Save best state
+                    self.best_fp_state = copy.deepcopy(self.fp_set.state_dict())
+                    self.best_univ_state = copy.deepcopy(self.univerifier.state_dict())
+                    patience_counter = 0
+                else:
+                    patience_counter += 1
+
+                # Early stopping if no improvement
+                if patience_counter > 10:
+                    print("  Early stopping - no improvement in validation")
+                    if self.best_fp_state is not None:  # Check if we have saved states
+                        self.fp_set.load_state_dict(self.best_fp_state)
+                        self.univerifier.load_state_dict(self.best_univ_state)
+                    break
+
+    def _update_fingerprints(self, pos_models, neg_models, lr_scale=1.0):  # Add lr_scale parameter
+        """
+        Update fingerprint graphs using gradient-based optimization.
+
+        Args:
+            pos_models: List of positive models
+            neg_models: List of negative models
+            lr_scale: Learning rate scaling factor (NEW)
+        """
+        for fp in self.fp_set.fps:
+            fp.X.requires_grad_(True)
+
+        for _ in range(self.config['FP_STEPS']):
+            rows, labels = [], []
+
+            # Collect positive model outputs
+            for m in pos_models:
+                rows.append(self.fp_set.concat_outputs(m, self.task_type, require_grad=True))
+                labels.append(1)
+
+            # Collect negative model outputs
+            for m in neg_models:
+                rows.append(self.fp_set.concat_outputs(m, self.task_type, require_grad=True))
+                labels.append(0)
+
+            # Align and stack outputs
+            X_batch = align_and_stack(rows, dim=0)
+            y_batch = torch.tensor(labels, device=self.device)
+
+            # Compute loss
+            self.univerifier.eval()
+            logits = self.univerifier(X_batch)
+            loss = F.cross_entropy(logits, y_batch)
+
+            # Zero gradients
+            for fp in self.fp_set.fps:
+                if fp.X.grad is not None:
+                    fp.X.grad.zero_()
+
+            # Backpropagate
+            loss.backward()
+
+            # 1) Feature update + projection with scaled learning rate
+            with torch.no_grad():
+                for fp in self.fp_set.fps:
+                    if fp.X.grad is not None:
+                        # Use scaled learning rate
+                        fp.X.add_(self.config['LR_X'] * lr_scale * fp.X.grad)  # Apply lr_scale here
+                        project_features_inplace(fp.X, low=-1.0, high=1.0)
+
+            # 2) Adjacency update via surrogate ∂A
+            surrogate_grad_list = []
+            with torch.no_grad():
+                for fp in self.fp_set.fps:
+                    g = build_surrogate_gradA_from_Xgrad(fp.X.grad)
+                    if g is None:
+                        g = torch.zeros((fp.n, fp.n), device=self.device if hasattr(self, 'device') else device)
+                    surrogate_grad_list.append(g)
+
+            self.fp_set.flip_adj_by_grad(surrogate_grad_list)
+
+    def _update_univerifier(self, pos_models, neg_models):
+        """
+        Update univerifier parameters.
+
+        Args:
+            pos_models: List of positive models
+            neg_models: List of negative models
+        """
+        for _ in range(self.config['V_STEPS']):
+            self.univerifier.train()
+
+            X, y = [], []
+
+            # Collect positive model outputs
+            for m in pos_models:
+                X.append(self.fp_set.concat_outputs(m, self.task_type, require_grad=False))
+                y.append(1)
+
+            # Collect negative model outputs
+            for m in neg_models:
+                X.append(self.fp_set.concat_outputs(m, self.task_type, require_grad=False))
+                y.append(0)
+
+            # Align and stack outputs
+            X_batch = align_and_stack(X, dim=0)
+            y_batch = torch.tensor(y, device=self.device)
+
+            # Compute loss and update
+            logits = self.univerifier(X_batch)
+            loss = F.cross_entropy(logits, y_batch)
+
+            self.opt_V.zero_grad()
+            loss.backward()
+            self.opt_V.step()
+
+    def _check_training_acc(self, pos_models, neg_models):
+        """
+        Check training accuracy during joint learning.
+
+        Args:
+            pos_models: List of positive models
+            neg_models: List of negative models
+
+        Returns:
+            float: Training accuracy
+        """
+        self.univerifier.eval()
+
+        with torch.no_grad():
+            X, y = [], []
+
+            # Collect positive model outputs
+            for m in pos_models:
+                X.append(self.fp_set.concat_outputs(m, self.task_type, require_grad=False))
+                y.append(1)
+
+            # Collect negative model outputs
+            for m in neg_models:
+                X.append(self.fp_set.concat_outputs(m, self.task_type, require_grad=False))
+                y.append(0)
+
+            # Align and stack outputs
+            X_batch = align_and_stack(X, dim=0)
+            y_batch = torch.tensor(y, device=self.device)
+
+            # Compute predictions and accuracy
+            pred = self.univerifier(X_batch).argmax(dim=1)
+            acc = (pred == y_batch).float().mean().item()
+
+        return acc
+
+    def _evaluate(self):
+        """
+        Evaluate the defense performance on test models.
+
+        Returns:
+            dict: Evaluation metrics
+        """
+        models_pos_te = [self.target_model] + self.pos_test
+        models_neg_te = self.neg_test
+
+        self.univerifier.eval()
+        pos_scores, neg_scores = [], []
+
+        # Collect scores for positive models
+        with torch.no_grad():
+            for m in models_pos_te:
+                x = self.fp_set.concat_outputs(m, self.task_type, require_grad=False)
+                logits = self.univerifier(x.unsqueeze(0))
+                prob = F.softmax(logits, dim=-1)[0, 1].item()
+                pos_scores.append(prob)
+
+        # Collect scores for negative models
+        with torch.no_grad():
+            for m in models_neg_te:
+                x = self.fp_set.concat_outputs(m, self.task_type, require_grad=False)
+                logits = self.univerifier(x.unsqueeze(0))
+                prob = F.softmax(logits, dim=-1)[0, 1].item()
+                neg_scores.append(prob)
+
+        pos_scores = np.array(pos_scores)
+        neg_scores = np.array(neg_scores)
+
+        # Find optimal threshold
+        thresholds = np.linspace(0, 1, 101)
+        best_acc = 0
+        best_metrics = {}
+
+        for t in thresholds:
+            tp = (pos_scores >= t).mean()
+            tn = (neg_scores < t).mean()
+            acc = (tp + tn) / 2
+
+            if acc > best_acc:
+                best_acc = acc
+                best_metrics = {
+                    'threshold': t,
+                    'robustness': tp,
+                    'uniqueness': tn,
+                    'accuracy': acc
+                }
+
+        # Compute ARUC
+        R, U = [], []
+        for t in thresholds:
+            R.append((pos_scores >= t).mean())
+            U.append((neg_scores < t).mean())
+        R, U = np.array(R), np.array(U)
+        aruc = np.trapezoid(np.minimum(R, U), thresholds)
+
+        # Print results
+        print(f"\n{'=' * 60}")
+        print(f"RESULTS: {self.task_type} on {self.dataset.dataset_name}")
+        print(f"{'=' * 60}")
+        print(f"ARUC: {aruc:.3f}")
+        print(f"Best Accuracy: {best_metrics['accuracy']:.3f}")
+        print(f"Robustness: {best_metrics['robustness']:.3f}")
+        print(f"Uniqueness: {best_metrics['uniqueness']:.3f}")
+        print(f"Threshold: {best_metrics['threshold']:.3f}")
+        print(f"{'=' * 60}\n")
+
+        return {
+            'aruc': aruc,
+            'accuracy': best_metrics['accuracy'],
+            'robustness': best_metrics['robustness'],
+            'uniqueness': best_metrics['uniqueness'],
+            'threshold': best_metrics['threshold'],
+            'task': self.task_type,
+            'dataset': self.dataset.dataset_name
+        }
