@@ -1,0 +1,177 @@
+# analyze_table8_double_extraction.py
+# Reproduce Table 8 (Double Extraction Robustness)
+# Matches Zhou et al. 2024 format
+
+import os, sys, copy
+import numpy as np, pandas as pd
+import torch, torch.nn.functional as F
+from torch_geometric.data import Data
+from sklearn.decomposition import PCA
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from run_table5 import (
+    load_dataset, set_seed, build_model,
+    train_model, model_to_vector_probs, get_setting_architectures, COwn
+)
+
+# -----------------------------
+# Config
+# -----------------------------
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+MODEL_TRAIN_EPOCHS = 80
+COWN_TRAIN_EPOCHS = 40
+EXTRACT_EPOCHS = 40
+SEEDS = [0, 1, 2]
+
+# -----------------------------
+# Double Extraction
+# -----------------------------
+def extract_once(target_model, data, epochs=EXTRACT_EPOCHS, device="cpu"):
+    """Perform a single extraction attack using pseudo-labels from target_model."""
+    target_model.eval()
+    with torch.no_grad():
+        logits = target_model(data.x.to(device), data.edge_index.to(device))
+        pseudo_labels = logits.argmax(dim=1).cpu()
+
+    extracted = build_model("GCN", data.num_features, len(torch.unique(data.y)), 2)
+    mask = torch.ones(data.num_nodes, dtype=torch.bool)
+    extracted = train_model(extracted, data, mask, epochs=epochs, device=device)
+    return extracted
+
+
+def double_extract_model(target_model, data, epochs=EXTRACT_EPOCHS, device="cpu"):
+    """Perform two rounds of extraction: F -> Ft -> Fs."""
+    Ft = extract_once(target_model, data, epochs=epochs, device=device)
+    Fs = extract_once(Ft, data, epochs=epochs, device=device)
+    return Fs
+
+
+# -----------------------------
+# Ownership verifier training
+# -----------------------------
+def train_ownership_verifier(data, setting, device="cpu"):
+    in_dim, out_dim = data.num_features, len(torch.unique(data.y))
+    Fs, Find, lFs, lFind = get_setting_architectures(setting)
+    owner_vecs, independent_vecs = [], []
+
+    # Owner models
+    for seed in SEEDS:
+        set_seed(seed)
+        mask = torch.randperm(data.num_nodes)[:int(0.6 * data.num_nodes)]
+        train_mask = torch.zeros(data.num_nodes, dtype=torch.bool)
+        train_mask[mask] = True
+        for arch in Fs:
+            m = build_model(arch, in_dim, out_dim, lFs)
+            m = train_model(m, data, train_mask, epochs=MODEL_TRAIN_EPOCHS, device=device)
+            owner_vecs.append(model_to_vector_probs(m, data, torch.arange(data.num_nodes)))
+
+    # Independent models
+    for seed in SEEDS:
+        set_seed(seed + 100)
+        mask = torch.randperm(data.num_nodes)[:int(0.3 * data.num_nodes)]
+        ind_mask = torch.zeros(data.num_nodes, dtype=torch.bool)
+        ind_mask[mask] = True
+        for arch in Find:
+            m = build_model(arch, in_dim, out_dim, lFind)
+            m = train_model(m, data, ind_mask, epochs=MODEL_TRAIN_EPOCHS, device=device)
+            independent_vecs.append(model_to_vector_probs(m, data, torch.arange(data.num_nodes)))
+
+    X_owner_np = np.vstack(owner_vecs)
+    X_ind_np = np.vstack(independent_vecs)
+    X_all = np.vstack([X_owner_np, X_ind_np])
+
+    n_samples, n_features = X_all.shape
+    n_comp = min(128, n_samples, n_features)
+    if n_comp < n_features:
+        pca = PCA(n_components=n_comp)
+        X_all = pca.fit_transform(X_all)
+    if X_all.shape[1] < 128:
+        padding = np.zeros((X_all.shape[0], 128 - X_all.shape[1]))
+        X_all = np.hstack([X_all, padding])
+
+    n_owner = len(owner_vecs)
+    X_owner_np = X_all[:n_owner]
+    X_ind_np = X_all[n_owner:]
+
+    X_train = torch.tensor(X_all, dtype=torch.float32, device=device)
+    y_train = torch.tensor(np.hstack([np.ones(n_owner), np.zeros(len(X_ind_np))]),
+                           dtype=torch.long, device=device)
+    cown = COwn(input_dim=128).to(device)
+    opt = torch.optim.Adam(cown.parameters(), lr=0.001)
+
+    for epoch in range(COWN_TRAIN_EPOCHS):
+        cown.train()
+        opt.zero_grad()
+        logits = cown(X_train)
+        loss = F.cross_entropy(logits, y_train)
+        loss.backward()
+        opt.step()
+
+    return cown, X_owner_np, X_ind_np
+
+
+# -----------------------------
+# Eval metrics (FPR, FNR, ACC)
+# -----------------------------
+def evaluate_cown(cown, X_owner_np, X_ind_np, device="cpu"):
+    X_owner = torch.tensor(X_owner_np, dtype=torch.float32, device=device)
+    X_ind = torch.tensor(X_ind_np, dtype=torch.float32, device=device)
+    cown.eval()
+    with torch.no_grad():
+        preds_owner = cown(X_owner).argmax(dim=1).cpu().numpy()
+        preds_ind = cown(X_ind).argmax(dim=1).cpu().numpy()
+    fnr = (preds_owner == 0).mean() * 100
+    fpr = (preds_ind == 1).mean() * 100
+    acc = ((preds_owner == 1).sum() + (preds_ind == 0).sum()) / (len(preds_owner) + len(preds_ind)) * 100
+    return fpr, fnr, acc
+
+
+# -----------------------------
+# Generate Table 8
+# -----------------------------
+def generate_table8(all_results_csv="results/table5_all_results.csv"):
+    df = pd.read_csv(all_results_csv)
+    if "cown_acc_mean" not in df.columns:
+        raise KeyError("Expected 'cown_acc_mean' in all_results.csv")
+
+    os.makedirs("results", exist_ok=True)
+    table8 = []
+
+    for (ds, st, md), sub in df.groupby(["dataset", "setting", "mode"]):
+        print(f"\n=== {ds} / Setting {st} / Mode {md} ===")
+        data, _ = load_dataset(ds, device=DEVICE)
+        num_nodes = data.num_nodes
+        train_nodes = torch.randperm(num_nodes)[:int(0.6 * num_nodes)]
+        train_mask = torch.zeros(num_nodes, dtype=torch.bool)
+        train_mask[train_nodes] = True
+
+        # Train base target
+        Fs, Find, lFs, lFind = get_setting_architectures(st)
+        target_arch = Fs[0] if len(Fs) > 0 else "GCN"
+        m = build_model(target_arch, data.num_features, len(torch.unique(data.y)), lFs)
+        m = train_model(m, data, train_mask, epochs=MODEL_TRAIN_EPOCHS, device=DEVICE)
+
+        ori_acc = (m(data.x.to(DEVICE), data.edge_index.to(DEVICE)).argmax(dim=1) == data.y.to(DEVICE)).float().mean().item() * 100
+
+        # Perform double extraction
+        m_double = double_extract_model(m, data, epochs=EXTRACT_EPOCHS, device=DEVICE)
+
+        # Train ownership verifier
+        trained_cown, X_owner_np, X_ind_np = train_ownership_verifier(data, st, device=DEVICE)
+        fpr, fnr, acc_cown = evaluate_cown(trained_cown, X_owner_np, X_ind_np, device=DEVICE)
+
+        table8.append({
+            "Dataset": ds, "Setting": st, "Mode": md,
+            "Ori_ACC(%)": round(ori_acc, 2),
+            "FPR(%)": round(fpr, 2),
+            "FNR(%)": round(fnr, 2),
+            "Double_ACC(%)": round(acc_cown, 2)
+        })
+
+    pd.DataFrame(table8).to_csv("results/table8.csv", index=False)
+    print("\n✅ Saved results/table8.csv")
+
+
+# -----------------------------
+if __name__ == "__main__":
+    generate_table8()
