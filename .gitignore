@@ -18,3 +18,7 @@ dist/
 
 #virtual environments folder
 .venv
+temp_results/
+robustness_results/
+*.pth
+*.pt

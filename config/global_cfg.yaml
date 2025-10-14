@@ -1,0 +1,13 @@
+target_model: gat
+target_hidden_dims: [224, 128]
+dataset: Cora
+train_setting: ""
+test_setting: 1
+embedding_dim: 128
+train_process: "train"
+test_process: "test"
+n_run: 3
+
+train_save_root: ../temp_results/diff/model_states/
+test_save_root: ../temp_results/diff/model_states/
+res_path: ../temp_results/diff/res/
