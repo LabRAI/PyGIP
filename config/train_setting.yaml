@@ -1,0 +1,4 @@
+model_arches: ["gat", "gcn", "sage"]
+layer_dims: [96,  160, 224, 288, 352]
+num_hidden_layers: [2]
+num_model_per_arch: 20 # per arch
