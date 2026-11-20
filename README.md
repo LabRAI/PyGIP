@@ -28,7 +28,7 @@ If you find it useful, please considering cite the following work:
 
 ## Installation
 
-PyGIP supports both CPU and GPU environments. Make sure you have Python installed (version >= 3.8, <3.13).
+PyGIP supports both CPU and GPU environments. Make sure you have Python installed (version >= 3.9, <3.13).
 
 ### Base Installation
 

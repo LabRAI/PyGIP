@@ -1,7 +1,7 @@
 Installation
 ============
 
-PyGIP requires Python 3.8+ and can be installed using pip. We recommend using a conda environment for installation.
+PyGIP requires Python 3.9+ and can be installed using pip. We recommend using a conda environment for installation.
 
 Installing PyGIP
 ----------------
@@ -12,7 +12,7 @@ To get started with PyGIP, set up your environment by installing the required de
 
     pip install -r requirements.txt
 
-Ensure you have Python installed (version 3.8 or higher recommended) along with the necessary libraries listed
+Ensure you have Python installed (version 3.9 or higher recommended) along with the necessary libraries listed
 in `requirements.txt`.
 
 Specifically, using following command to install `dgl 2.2.1` and ensure your `pytorch==2.3.0`.
@@ -36,7 +36,7 @@ For GPU (cuda 12.1)
 Requirements
 ------------
 
-- Python >= 3.8
+- Python >= 3.9
 - PyTorch == 2.3
 - torch-geometric >= 2.6.0
 - dgl == 2.2.1

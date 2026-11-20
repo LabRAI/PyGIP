@@ -4,6 +4,10 @@ import sys
 
 sys.path.insert(0, os.path.abspath('../../'))
 
+# Import scipy.stats before autodoc mocks torch: newer SciPy probes
+# torch.Tensor at import time and fails on the mocked module.
+import scipy.stats  # noqa: E402,F401
+
 project = 'PyGIP'
 copyright = '2025, RAILab'
 author = 'RAILab'
