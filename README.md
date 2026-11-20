@@ -2,7 +2,7 @@
 
 [![PyPI - Version](https://img.shields.io/pypi/v/PyGIP)](https://pypi.org/project/PyGIP)
 [![Build Status](https://img.shields.io/github/actions/workflow/status/LabRAI/PyGIP/docs.yml)](https://github.com/LabRAI/PyGIP/actions)
-[![License](https://img.shields.io/github/license/LabRAI/PyGIP.svg)](https://github.com/LabRAI/PyGIP/blob/main/LICENSE)
+[![License](https://img.shields.io/badge/License-PolyForm%20Noncommercial%201.0.0-blue)](https://github.com/LabRAI/PyGIP/blob/main/LICENSE)
 [![PyPI - Downloads](https://img.shields.io/pypi/dm/pygip)](https://github.com/LabRAI/PyGIP)
 [![Issues](https://img.shields.io/github/issues/LabRAI/PyGIP)](https://github.com/LabRAI/PyGIP)
 [![Pull Requests](https://img.shields.io/github/issues-pr/LabRAI/PyGIP)](https://github.com/LabRAI/PyGIP)
@@ -111,7 +111,7 @@ Refer to [Contributors Guideline](.github/CONTRIBUTING.md)
 
 ## License
 
-[BSD 2-Clause License](LICENSE)
+PyGIP is licensed under the [PolyForm Noncommercial License 1.0.0](LICENSE) for noncommercial use. For commercial licensing, please contact commercialization@fsu.edu.
 
 ## Contact
 

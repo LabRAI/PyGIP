@@ -12,7 +12,7 @@
    :target: https://github.com/LabRAI/PyGIP/actions
    :alt: Build Status
 
-.. image:: https://img.shields.io/github/license/LabRAI/PyGIP.svg
+.. image:: https://img.shields.io/badge/License-PolyForm%20Noncommercial%201.0.0-blue
    :target: https://github.com/LabRAI/PyGIP/blob/main/LICENSE
    :alt: License
 

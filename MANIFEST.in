@@ -7,3 +7,5 @@ prune .github
 prune tests
 
 global-exclude __pycache__ *.py[cod] *.so *.dylib
+include CHANGELOG.md
+
