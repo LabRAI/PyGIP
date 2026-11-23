@@ -1,0 +1,9 @@
+{
+  "val_acc": null,
+  "test_acc": 0.7488789237668162,
+  "lp_auc_test": null,
+  "fp_auc_test": 0.9986111111111111,
+  "mean_test_acc": null,
+  "aruc": 0.9986111111111111,
+  "matcher_auc": null
+}
