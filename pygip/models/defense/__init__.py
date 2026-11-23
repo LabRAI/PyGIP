@@ -8,6 +8,7 @@ from .atom.ATOM import ATOM
 from .Integrity import QueryBasedVerificationDefense as IntegrityVerification
 from .GrOVe import GroveDefense
 from .Revisiting import Revisiting
+from .MDP import MDP
 
 __all__ = [
     'BackdoorWM',
@@ -16,8 +17,9 @@ __all__ = [
     'RandomWM',
     'SurviveWM',
     'SurviveWM2',
-    'IntegrityVerification'
-    'GroveDefense'
+    'IntegrityVerification',
+    'GroveDefense',
     'ATOM',
-    'Revisiting'
+    'Revisiting',
+    'MDP',
 ]
