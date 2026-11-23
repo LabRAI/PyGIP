@@ -18,3 +18,5 @@ dist/
 
 #virtual environments folder
 .venv
+examples/*.pth
+data/

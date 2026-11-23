@@ -1,0 +1,69 @@
+## Title
+feat(ci): make examples/run_genie_experiments robust for CI and add small-demo fallbacks
+
+## Summary
+This patch makes `examples/run_genie_experiments.py` robust to CI environments and minimal local setups by:
+- Adding safe fallbacks when optional dependencies (e.g., `dgl` or repo-specific dataset helpers) are missing.
+- Making pruning optional so that extraction (the core demo) still runs without DGL.
+- Adding a minimal `pygip.models.gcn_link_predictor.GCNLinkPredictor` (tiny GCN link predictor) so the extraction pipeline can instantiate surrogate models in CI.
+- Adding a tiny demo trainer helper (`examples/train_small_predictor.py`) and a fallback path that writes a small demo checkpoint if the trainer helper is missing.
+- Adding tests to exercise the fallback logic: `tests/test_genie_smoke.py` (existing) and `tests/test_genie_fallbacks.py` (new).
+
+This keeps normal developer behavior unchanged (local users with full deps still get the regular experience) while ensuring the CI smoke workflow completes quickly and reliably.
+
+## Motivation / Background
+CI runners or minimal environments may not have optional heavy libraries (`dgl`, etc.) or additional example helper scripts available. The changes ensure the "smoke" example (run_genie_experiments) completes and prints the expected "Extraction results:" line for automated CI verification.
+
+## Changes
+- `examples/run_genie_experiments.py` — main changes:
+  - lazy-import dataset helpers
+  - fallback to `torch_geometric.datasets.Planetoid("Cora")` when `pygip.datasets.Cora` is missing
+  - fallback to tiny demo teacher checkpoint if `examples/train_small_predictor.py` helper not present
+  - only run pruning attack when pruning implementation is importable (DGL optional)
+- `pygip/models/gcn_link_predictor.py` — added minimal surrogate model used by extraction/pruning code and by the small demo trainer fallback
+- `examples/train_small_predictor.py` — tiny trainer helper for local quick runs (CI uses fallback quicker path)
+- `tests/test_genie_fallbacks.py` — new test exercising fallback paths (ensures CI-friendly behavior)
+
+## How to run locally (quick)
+1. Clone and set PYTHONPATH:
+
+`git clone https://github.com/Sparshkhare1306/PyGIP.git`
+
+`cd PyGIP`
+
+`git checkout feature/genie-extraction`
+
+`export PYTHONPATH="$(pwd):$PYTHONPATH"`
+
+2. Run tests:
+
+`pytest -q`
+
+3. Quick run the example (local reproduction):
+
+`python examples/run_genie_experiments.py --dataset Cora --device cpu --query_ratio 0.05 --prune_ratio 0.1 --auto_train_epochs 1`
+
+**Expected:** prints "Extraction results:" and then prints pruning results (pruning may be skipped if DGL is not available). On local machines you may also see `torch-geometric` warnings about `torch-scatter` / `torch-sparse`—these are non-fatal.
+
+## Reproducing the CA-HepTh surrogate evaluation (optional)
+I have precomputed surrogates in `examples/surrogates_ca_hepth_qs.zip` (not checked into git). To verify locally, download or extract the zip and inspect:
+
+`shasum -a 256 examples/surrogates_ca_hepth_qs.zip`
+
+`python examples/quick_check_surrogate.py --dataset CA-HepTh --surrogate examples/surrogate_CA-HepTh_q10.pth --device cpu`
+
+Expected surrogate test AUC (approx): 0.80–0.85 for q=0.1 (this is an approximate expected range for the precomputed files).
+
+## Security / format note
+Currently the demo checkpoint saved for fallback is a full `torch.save(model, ...)` object for compatibility. If you prefer safer artifacts, I can change the saving/loading to only use `state_dict` and modify the loader accordingly. This reduces attack surface when loading untrusted checkpoints.
+
+## Checklist (before merging)
+- [ ] Confirm `pytest -q` passes in CI (smoke workflow).
+- [ ] Check there are no accidental large binaries committed. If you want to add `surrogates_ca_hepth_qs.zip`, prefer attaching it to a GitHub Release (not committing to repo).
+- [ ] Decide whether to change demo checkpoint to `state_dict` (I can prepare a follow-up patch if desired).
+
+## Notes for reviewer
+- The core functionality remains unchanged for developers with full dependencies.
+- The fallbacks only activate in minimal CI environments.
+- If desired, I can add a short README section explaining how to run the extraction/pruning experiments locally step-by-step.
+
