@@ -7,6 +7,7 @@ from .datasets import (
     Photo,
     CoauthorCS,
     CoauthorPhysics,
+    TUGraph,
 )
 
 __all__ = [

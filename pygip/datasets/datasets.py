@@ -1,17 +1,44 @@
-import dgl
+# --- Optional DGL imports (only required when api_type == "dgl") ---
+try:
+    import dgl  # type: ignore
+    from dgl import DGLGraph  # type: ignore
+
+    # DGL datasets (graph classification / node classification)
+    from dgl.data import (  # type: ignore
+        AmazonCoBuyComputerDataset,  # Amazon-Computer
+        AmazonCoBuyPhotoDataset,     # Amazon-Photo
+        CoauthorCSDataset,           # Coauthor-CS
+        CoauthorPhysicsDataset,      # Coauthor-Physics
+        CoraGraphDataset,
+        CiteseerGraphDataset,
+        PubmedGraphDataset,
+    )
+except ImportError:
+    dgl = None
+    DGLGraph = None
+
+    AmazonCoBuyComputerDataset = None
+    AmazonCoBuyPhotoDataset = None
+    CoauthorCSDataset = None
+    CoauthorPhysicsDataset = None
+    CoraGraphDataset = None
+    CiteseerGraphDataset = None
+    PubmedGraphDataset = None
+# ---------------------------------------------------------------
+
+try:
+    import dgl  # optional: only needed when api_type == "dgl"
+except ImportError:
+    dgl = None
 import numpy as np
 import torch
-from dgl import DGLGraph
-from dgl.data import AmazonCoBuyComputerDataset  # Amazon-Computer
-from dgl.data import AmazonCoBuyPhotoDataset  # Amazon-Photo
-from dgl.data import CoauthorCSDataset, CoauthorPhysicsDataset
-from dgl.data import FakeNewsDataset
-from dgl.data import FlickrDataset
-from dgl.data import GINDataset
-from dgl.data import MUTAGDataset
-from dgl.data import RedditDataset
-from dgl.data import YelpDataset
-from dgl.data import citation_graph  # Cora, CiteSeer, PubMed
+try:
+    import dgl  # optional
+    from dgl import DGLGraph  # type: ignore
+except ImportError:
+    dgl = None
+    DGLGraph = None  # type: ignore
+
 from sklearn.model_selection import StratifiedShuffleSplit
 from torch_geometric.data import Data as PyGData
 from torch_geometric.datasets import Amazon  # Amazon Computers, Photo
@@ -62,6 +89,13 @@ class Dataset(object):
     def __init__(self, api_type='dgl', path='./data'):
         assert api_type in {'dgl', 'pyg'}, 'API type must be dgl or pyg'
         self.api_type = api_type
+        if self.api_type == "dgl" and dgl is None:
+            raise ImportError(
+                "DGL is not installed, but api_type='dgl' was requested. "
+                "Install DGL (or run on a platform that supports DGL wheels) "
+                "or use api_type='pyg'."
+            )
+
         self.path = path
         self.dataset_name = self.get_name()
 
@@ -259,6 +293,34 @@ class Dataset(object):
         return (f"Dataset(name={self.dataset_name}, api_type={self.api_type}, "
                 f"#Nodes={self.num_nodes}, #Features={self.num_features}, "
                 f"#Classes={self.num_classes})")
+
+class TUGraph(Dataset):
+    """
+    PyG wrapper for TU graph classification datasets (e.g., NCI109, AIDS, Mutagenicity).
+    This is graph-level classification, so we set graph_dataset and do not use graph_data.
+    """
+    def __init__(self, name: str, api_type: str = "pyg", path: str = "./data"):
+        self.name = name
+        super().__init__(api_type=api_type, path=path)
+
+    def get_name(self):
+        return self.name
+
+    def load_dgl_data(self):
+        raise ImportError("TUGraph only supports api_type='pyg' (DGL not required).")
+
+    def load_pyg_data(self):
+        # torch_geometric.datasets.TUDataset is already imported at top
+        self.graph_dataset = TUDataset(root=self.path, name=self.name)
+        self.graph_data = None  # graph classification datasets are list-like
+
+    def _load_meta_data(self):
+        # Override because base _load_meta_data assumes a single PyGData in self.graph_data
+        # For TU datasets, metadata comes from the dataset object.
+        self.num_nodes = 0  # varies per graph
+        self.num_features = self.graph_dataset.num_features
+        self.num_classes = self.graph_dataset.num_classes
+
 
 
 class Cora(Dataset):

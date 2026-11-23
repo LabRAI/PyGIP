@@ -18,3 +18,21 @@ dist/
 
 #virtual environments folder
 .venv
+
+# Local datasets / artifacts (do not commit)
+data/
+*.pt
+*.pth
+*.zip
+
+# accidental local files
+2.2.0
+
+# Local datasets / artifacts (do not commit)
+data/
+*.pt
+*.pth
+*.zip
+
+# accidental local files
+2.2.0
